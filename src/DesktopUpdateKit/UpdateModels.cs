@@ -66,7 +66,8 @@ public sealed record UpdateDownloadProgress(
     long BytesReceived,
     long? TotalBytes,
     double BytesPerSecond,
-    string? NodeId = null)
+    string? NodeId = null,
+    int ActiveConnectionCount = 1)
 {
     public double? Fraction => TotalBytes is > 0
         ? (double)BytesReceived / TotalBytes.Value

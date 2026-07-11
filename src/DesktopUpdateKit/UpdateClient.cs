@@ -476,7 +476,7 @@ public sealed class UpdateClient
             FileOptions.Asynchronous | FileOptions.RandomAccess);
         output.SetLength(totalBytes);
 
-        var reporter = new DownloadProgressReporter(progress, totalBytes, nodeId);
+        var reporter = new DownloadProgressReporter(progress, totalBytes, nodeId, ranges.Count);
         SafeFileHandle outputHandle = output.SafeFileHandle;
         var downloads = ranges.Select(range => DownloadRangeAsync(
             url,
@@ -565,7 +565,7 @@ public sealed class UpdateClient
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         var buffer = new byte[_downloadOptions.EffectiveBufferBytes];
-        var reporter = new DownloadProgressReporter(progress, expectedBytes ?? total, nodeId);
+        var reporter = new DownloadProgressReporter(progress, expectedBytes ?? total, nodeId, connectionCount: 1);
         long copied = 0;
         var validatedHeader = false;
         while (true)
@@ -764,21 +764,37 @@ public sealed class UpdateClient
         private readonly IProgress<UpdateDownloadProgress>? _progress;
         private readonly long? _totalBytes;
         private readonly string _nodeId;
+        private readonly int _connectionCount;
         private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
         private readonly object _sync = new();
+        private readonly Queue<(TimeSpan Timestamp, int Bytes)> _speedSamples = new();
         private long _bytesReceived;
+        private long _speedWindowBytes;
         private TimeSpan _lastReport;
 
-        public DownloadProgressReporter(IProgress<UpdateDownloadProgress>? progress, long? totalBytes, string nodeId)
+        public DownloadProgressReporter(
+            IProgress<UpdateDownloadProgress>? progress,
+            long? totalBytes,
+            string nodeId,
+            int connectionCount)
         {
             _progress = progress;
             _totalBytes = totalBytes;
             _nodeId = nodeId;
+            _connectionCount = Math.Max(1, connectionCount);
         }
 
         public void Add(int byteCount)
         {
             Interlocked.Add(ref _bytesReceived, byteCount);
+            var timestamp = _stopwatch.Elapsed;
+            lock (_sync)
+            {
+                _speedSamples.Enqueue((timestamp, byteCount));
+                _speedWindowBytes += byteCount;
+                TrimSpeedSamples(timestamp);
+            }
+
             Report(force: false);
         }
 
@@ -792,6 +808,7 @@ public sealed class UpdateClient
             }
 
             var elapsed = _stopwatch.Elapsed;
+            double bytesPerSecond;
             lock (_sync)
             {
                 if (!force && elapsed - _lastReport < TimeSpan.FromMilliseconds(120))
@@ -800,11 +817,28 @@ public sealed class UpdateClient
                 }
 
                 _lastReport = elapsed;
+                TrimSpeedSamples(elapsed);
+                var windowStart = _speedSamples.Count > 0 ? _speedSamples.Peek().Timestamp : elapsed;
+                var windowSeconds = Math.Max(0.25, (elapsed - windowStart).TotalSeconds);
+                bytesPerSecond = _speedWindowBytes / windowSeconds;
             }
 
             var bytesReceived = Interlocked.Read(ref _bytesReceived);
-            var bytesPerSecond = bytesReceived / Math.Max(0.001, elapsed.TotalSeconds);
-            _progress.Report(new UpdateDownloadProgress(bytesReceived, _totalBytes, bytesPerSecond, _nodeId));
+            _progress.Report(new UpdateDownloadProgress(
+                bytesReceived,
+                _totalBytes,
+                bytesPerSecond,
+                _nodeId,
+                _connectionCount));
+        }
+
+        private void TrimSpeedSamples(TimeSpan now)
+        {
+            while (_speedSamples.Count > 1
+                   && now - _speedSamples.Peek().Timestamp > TimeSpan.FromSeconds(2))
+            {
+                _speedWindowBytes -= _speedSamples.Dequeue().Bytes;
+            }
         }
     }
 }
