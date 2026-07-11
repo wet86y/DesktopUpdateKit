@@ -1,8 +1,10 @@
 using System.IO;
 using System.Diagnostics;
 using System.Net.Http;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace DesktopUpdateKit;
 
@@ -10,10 +12,12 @@ public sealed class UpdateClient
 {
     private readonly UpdateClientOptions _options;
     private readonly HttpClient _httpClient;
+    private readonly UpdateDownloadOptions _downloadOptions;
 
     public UpdateClient(UpdateClientOptions options, HttpClient? httpClient = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _downloadOptions = _options.DownloadOptions ?? new UpdateDownloadOptions();
         _httpClient = httpClient ?? new HttpClient();
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd($"{_options.ApplicationId}-UpdateClient/1.0");
         _httpClient.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
@@ -52,8 +56,20 @@ public sealed class UpdateClient
 
         try
         {
-            await DownloadFileAsync(release.ExeDownloadUrl, downloadedPath, progress, downloadControl, cancellationToken);
-            await DownloadFileAsync(release.Sha256DownloadUrl, shaPath, null, null, cancellationToken);
+            await DownloadFileAsync(
+                release.ExeDownloadUrl,
+                downloadedPath,
+                progress,
+                downloadControl,
+                allowParallelDownload: true,
+                cancellationToken);
+            await DownloadFileAsync(
+                release.Sha256DownloadUrl,
+                shaPath,
+                progress: null,
+                downloadControl: null,
+                allowParallelDownload: false,
+                cancellationToken);
 
             var expectedHash = ParseSha256(await File.ReadAllTextAsync(shaPath, cancellationToken));
             var actualHash = await ComputeSha256Async(downloadedPath, cancellationToken);
@@ -146,6 +162,127 @@ public sealed class UpdateClient
         string destinationPath,
         IProgress<UpdateDownloadProgress>? progress,
         UpdateDownloadControl? downloadControl,
+        bool allowParallelDownload,
+        CancellationToken cancellationToken)
+    {
+        if (allowParallelDownload && _downloadOptions.EffectiveMaxConcurrentConnections > 1)
+        {
+            var remoteLength = await TryGetRangeLengthAsync(url, cancellationToken);
+            if (remoteLength >= _downloadOptions.EffectiveMinimumParallelDownloadBytes)
+            {
+                try
+                {
+                    await DownloadInParallelAsync(url, destinationPath, remoteLength.Value, progress, downloadControl, cancellationToken);
+                    return;
+                }
+                catch (RangeDownloadNotSupportedException)
+                {
+                    TryDeleteFile(destinationPath);
+                }
+            }
+        }
+
+        await DownloadSingleAsync(url, destinationPath, progress, downloadControl, cancellationToken);
+    }
+
+    private async Task<long?> TryGetRangeLengthAsync(string url, CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        return response.StatusCode == HttpStatusCode.PartialContent
+            ? response.Content.Headers.ContentRange?.Length
+            : null;
+    }
+
+    private async Task DownloadInParallelAsync(
+        string url,
+        string destinationPath,
+        long totalBytes,
+        IProgress<UpdateDownloadProgress>? progress,
+        UpdateDownloadControl? downloadControl,
+        CancellationToken cancellationToken)
+    {
+        var ranges = CreateRanges(totalBytes, _downloadOptions.EffectiveMaxConcurrentConnections);
+        await using var output = new FileStream(
+            destinationPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.Read,
+            bufferSize: 1,
+            FileOptions.Asynchronous | FileOptions.RandomAccess);
+        output.SetLength(totalBytes);
+
+        var reporter = new DownloadProgressReporter(progress, totalBytes);
+        SafeFileHandle outputHandle = output.SafeFileHandle;
+        var downloads = ranges.Select(range => DownloadRangeAsync(
+            url,
+            range,
+            totalBytes,
+            outputHandle,
+            reporter,
+            downloadControl,
+            cancellationToken));
+
+        await Task.WhenAll(downloads);
+        await output.FlushAsync(cancellationToken);
+        reporter.Complete();
+    }
+
+    private async Task DownloadRangeAsync(
+        string url,
+        ByteRange range,
+        long totalBytes,
+        SafeFileHandle outputHandle,
+        DownloadProgressReporter reporter,
+        UpdateDownloadControl? downloadControl,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(range.Start, range.End);
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (response.StatusCode != HttpStatusCode.PartialContent)
+        {
+            throw new RangeDownloadNotSupportedException();
+        }
+
+        var contentRange = response.Content.Headers.ContentRange;
+        if (contentRange?.From != range.Start || contentRange.To != range.End || contentRange.Length != totalBytes)
+        {
+            throw new RangeDownloadNotSupportedException();
+        }
+
+        await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var buffer = new byte[_downloadOptions.EffectiveBufferBytes];
+        var offset = range.Start;
+        while (offset <= range.End)
+        {
+            if (downloadControl is not null)
+            {
+                await downloadControl.WaitIfPausedAsync(cancellationToken);
+            }
+
+            var remaining = range.End - offset + 1;
+            var requested = (int)Math.Min(buffer.Length, remaining);
+            var read = await input.ReadAsync(buffer.AsMemory(0, requested), cancellationToken);
+            if (read == 0)
+            {
+                throw new EndOfStreamException("The update server returned an incomplete byte range.");
+            }
+
+            await RandomAccess.WriteAsync(outputHandle, buffer.AsMemory(0, read), offset, cancellationToken);
+            offset += read;
+            reporter.Add(read);
+        }
+    }
+
+    private async Task DownloadSingleAsync(
+        string url,
+        string destinationPath,
+        IProgress<UpdateDownloadProgress>? progress,
+        UpdateDownloadControl? downloadControl,
         CancellationToken cancellationToken)
     {
         using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
@@ -154,10 +291,8 @@ public sealed class UpdateClient
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
 
-        var buffer = new byte[512 * 1024];
-        long copied = 0;
-        var stopwatch = Stopwatch.StartNew();
-        var lastReport = TimeSpan.Zero;
+        var buffer = new byte[_downloadOptions.EffectiveBufferBytes];
+        var reporter = new DownloadProgressReporter(progress, total);
         int read;
         while (true)
         {
@@ -173,15 +308,10 @@ public sealed class UpdateClient
             }
 
             await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            copied += read;
-            if (progress is not null && (stopwatch.Elapsed - lastReport >= TimeSpan.FromMilliseconds(120)))
-            {
-                progress.Report(new UpdateDownloadProgress(copied, total, copied / Math.Max(0.001, stopwatch.Elapsed.TotalSeconds)));
-                lastReport = stopwatch.Elapsed;
-            }
+            reporter.Add(read);
         }
 
-        progress?.Report(new UpdateDownloadProgress(copied, total, copied / Math.Max(0.001, stopwatch.Elapsed.TotalSeconds)));
+        reporter.Complete();
     }
 
     private static string ParseSha256(string text)
@@ -217,6 +347,91 @@ public sealed class UpdateClient
         catch
         {
             // Best-effort cleanup. The next update can remove stale folders.
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // The outer transaction cleanup will make a second best-effort attempt.
+        }
+    }
+
+    private static IReadOnlyList<ByteRange> CreateRanges(long totalBytes, int requestedConnections)
+    {
+        var count = (int)Math.Min(requestedConnections, totalBytes);
+        var ranges = new List<ByteRange>(count);
+        var baseLength = totalBytes / count;
+        var remainder = totalBytes % count;
+        long start = 0;
+        for (var index = 0; index < count; index++)
+        {
+            var length = baseLength + (index < remainder ? 1 : 0);
+            ranges.Add(new ByteRange(start, start + length - 1));
+            start += length;
+        }
+
+        return ranges;
+    }
+
+    private sealed record ByteRange(long Start, long End);
+
+    private sealed class RangeDownloadNotSupportedException : Exception
+    {
+    }
+
+    private sealed class DownloadProgressReporter
+    {
+        private readonly IProgress<UpdateDownloadProgress>? _progress;
+        private readonly long? _totalBytes;
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private readonly object _sync = new();
+        private long _bytesReceived;
+        private TimeSpan _lastReport;
+
+        public DownloadProgressReporter(IProgress<UpdateDownloadProgress>? progress, long? totalBytes)
+        {
+            _progress = progress;
+            _totalBytes = totalBytes;
+        }
+
+        public void Add(int byteCount)
+        {
+            Interlocked.Add(ref _bytesReceived, byteCount);
+            Report(force: false);
+        }
+
+        public void Complete() => Report(force: true);
+
+        private void Report(bool force)
+        {
+            if (_progress is null)
+            {
+                return;
+            }
+
+            var elapsed = _stopwatch.Elapsed;
+            lock (_sync)
+            {
+                if (!force && elapsed - _lastReport < TimeSpan.FromMilliseconds(120))
+                {
+                    return;
+                }
+
+                _lastReport = elapsed;
+            }
+
+            var bytesReceived = Interlocked.Read(ref _bytesReceived);
+            var bytesPerSecond = bytesReceived / Math.Max(0.001, elapsed.TotalSeconds);
+            _progress.Report(new UpdateDownloadProgress(bytesReceived, _totalBytes, bytesPerSecond));
         }
     }
 }
