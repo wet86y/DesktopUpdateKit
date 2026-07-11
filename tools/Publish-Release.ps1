@@ -38,4 +38,4 @@ if ($Finalize) {
     gh release edit $TagName --repo $Config.repository --draft=false
 }
 
-Write-Host "Release assets uploaded for $Config.repository $TagName"
+Write-Host "Release assets uploaded for $($Config.repository) $TagName"
