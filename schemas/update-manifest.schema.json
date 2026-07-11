@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["version", "repository", "asset", "sha256Asset", "sha256"],
+  "properties": {
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" },
+    "channel": { "type": "string" },
+    "repository": { "type": "string" },
+    "tag": { "type": "string" },
+    "asset": { "type": "string" },
+    "sha256Asset": { "type": "string" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "size": { "type": "integer", "minimum": 0 },
+    "downloadUrl": { "type": "string", "format": "uri" },
+    "sha256Url": { "type": "string", "format": "uri" },
+    "releaseNotesUrl": { "type": "string", "format": "uri" },
+    "releaseNotes": { "type": "string" }
+  }
+}
