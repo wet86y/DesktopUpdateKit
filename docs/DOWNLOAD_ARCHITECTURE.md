@@ -4,7 +4,7 @@
 
 ## 当前能力
 
-- 更新清单仍从配置的 GitHub Release 读取；资产下载地址由配置的仓库和资产名构造，不信任远端清单中的任意下载域名。
+- 更新清单仍从配置的 GitHub Release 读取；官方原始资产地址由配置的仓库、Tag 和资产名构造，不使用远端清单的 `downloadUrl` 字段。远程节点只能通过受校验的 `{url}` 模板包装该官方地址。
 - 完整更新 EXE 在大于 16 MiB 时，先以 HTTP `Range: bytes=0-0` 探测服务端支持。
 - 探测成功后，按均匀字节区间使用最多 4 个 HTTPS 连接并行下载；连接数、阈值和缓冲区大小通过 `UpdateDownloadOptions` 复用配置。
 - 任意分块未返回正确的 `206 Partial Content` 或 `Content-Range` 时，自动删除不完整文件并退回单连接下载。
@@ -13,12 +13,32 @@
 
 当前版本不会在应用退出或取消后保留 `.part` 文件，因此尚不提供跨进程断点续传。若以后加入持久断点、镜像择优、增量补丁或测速回退，均必须在本目录内实现，并保持完整 EXE + SHA-256 回退路径。
 
+## GitHub 下载节点
+
+完整 EXE 可以通过 `update.json` 的 `downloadNodes` 数组提供下载节点。每个节点均为统一结构：
+
+```json
+{
+  "id": "gh-proxy",
+  "template": "https://gh-proxy.com/{url}",
+  "priority": 10,
+  "enabled": true
+}
+```
+
+`{url}` 只会替换为当前清单对应的、带固定 Tag 的官方 GitHub Release EXE 地址；不会使用 `latest/download`，从而避免下载期间发布新版本导致资产与 SHA 不一致。内置节点作为最终回退包含 `gh-proxy`、`gh-llkk`、`ghproxy-net` 和 `github-direct`。官方节点始终强制启用且模板固定为 `{url}`。
+
+节点选择顺序是：上次通过完整大小与 SHA-256 校验的节点、当前远程节点优先级、GitHub 官方。远程节点缺失或无效时使用 `%LocalAppData%\<application-id>\update-node-cache.json` 中最长 7 天的节点目录；缓存也不可用时使用内置节点。缓存仅保存节点配置、最后成功节点和延迟，不保存代理账号、令牌或下载内容。
+
+每个节点按顺序使用 `GET` 与 `Range: bytes=0-65535` 探测，不使用 HEAD，不并发测速。探测要求 5 秒内收到非 HTML 的 EXE 响应；`206` 且 `Content-Range` 正确时可使用分块下载，`200` 时只允许单连接下载。节点实际下载最多重试一次；连接阶段 5 秒超时、任何一次读取连续 20 秒无数据即切换下一个节点。所有节点最终都必须通过清单大小、发布 SHA 文件和 EXE SHA-256 三重校验。
+
 ## 项目接入边界
 
 项目通过链接编译 `src\DesktopUpdateKit\UpdateClient.cs`、`UpdateModels.cs` 和 `UpdateLauncher.cs` 接入：
 
 - 项目 UI 可以传入进度回调、暂停控制和取消令牌。
 - 项目 UI 不得创建 HTTP Range 请求、管理分段文件、合并字节块或自行计算更新包完整性。
+- 项目 UI 只能显示共享组件报告的节点 ID、进度与失败状态；不得为任何节点写专用下载逻辑。
 - 系统 DNS、`hosts`、代理和网络设置由用户及操作系统管理；共享组件不得改写它们，也不得硬编码 GitHub/CDN IP。
 
 ## 验收要求

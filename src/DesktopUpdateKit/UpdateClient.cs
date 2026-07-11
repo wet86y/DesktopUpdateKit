@@ -1,7 +1,7 @@
-using System.IO;
 using System.Diagnostics;
-using System.Net.Http;
+using System.IO;
 using System.Net;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
@@ -10,14 +10,25 @@ namespace DesktopUpdateKit;
 
 public sealed class UpdateClient
 {
+    private const int ProbeByteCount = 64 * 1024;
+    private static readonly UpdateDownloadNode[] BuiltInNodes =
+    [
+        new("gh-proxy", "https://gh-proxy.com/{url}", 10),
+        new("gh-llkk", "https://gh.llkk.cc/{url}", 20),
+        new("ghproxy-net", "https://ghproxy.net/{url}", 30),
+        new("github-direct", "{url}", 1000)
+    ];
+
     private readonly UpdateClientOptions _options;
     private readonly HttpClient _httpClient;
     private readonly UpdateDownloadOptions _downloadOptions;
+    private readonly UpdateNodeCache _nodeCache;
 
     public UpdateClient(UpdateClientOptions options, HttpClient? httpClient = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _downloadOptions = _options.DownloadOptions ?? new UpdateDownloadOptions();
+        _nodeCache = new UpdateNodeCache(_options.ApplicationId);
         _httpClient = httpClient ?? new HttpClient();
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd($"{_options.ApplicationId}-UpdateClient/1.0");
         _httpClient.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
@@ -36,7 +47,18 @@ public sealed class UpdateClient
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         var release = await ParseManifestAsync(stream, cancellationToken);
-        return release is not null && release.Version > GetCurrentVersion() ? release : null;
+        if (release is null)
+        {
+            return null;
+        }
+
+        var remoteNodes = NormalizeNodes(release.DownloadNodes);
+        if (remoteNodes.Count > 0)
+        {
+            await _nodeCache.SaveNodesAsync(remoteNodes, cancellationToken);
+        }
+
+        return release.Version > GetCurrentVersion() ? release : null;
     }
 
     public async Task<string> DownloadAndVerifyAsync(
@@ -45,6 +67,12 @@ public sealed class UpdateClient
         UpdateDownloadControl? downloadControl = null,
         CancellationToken cancellationToken = default)
     {
+        if (release.ExeSize is not > 0)
+        {
+            throw new InvalidDataException("The update manifest is missing a valid executable size.");
+        }
+
+        var expectedHash = ParseSha256(release.ExpectedSha256);
         var tempDirectoryName = string.IsNullOrWhiteSpace(_options.TempDirectoryName)
             ? $"{_options.ApplicationId}-update"
             : _options.TempDirectoryName;
@@ -56,31 +84,74 @@ public sealed class UpdateClient
 
         try
         {
-            await DownloadFileAsync(
-                release.ExeDownloadUrl,
-                downloadedPath,
-                progress,
-                downloadControl,
-                allowParallelDownload: true,
-                cancellationToken);
-            await DownloadFileAsync(
+            // The manifest SHA-256 and the separately published SHA file must
+            // agree before any third-party node is trusted with the EXE bytes.
+            await DownloadSingleAsync(
                 release.Sha256DownloadUrl,
                 shaPath,
+                expectedBytes: null,
                 progress: null,
                 downloadControl: null,
-                allowParallelDownload: false,
+                nodeId: "github-direct",
                 cancellationToken);
-
-            var expectedHash = ParseSha256(await File.ReadAllTextAsync(shaPath, cancellationToken));
-            var actualHash = await ComputeSha256Async(downloadedPath, cancellationToken);
+            var publishedHash = ParseSha256(await File.ReadAllTextAsync(shaPath, cancellationToken));
             if (!CryptographicOperations.FixedTimeEquals(
                     Convert.FromHexString(expectedHash),
-                    Convert.FromHexString(actualHash)))
+                    Convert.FromHexString(publishedHash)))
             {
-                throw new InvalidDataException("The downloaded update failed SHA-256 verification.");
+                throw new InvalidDataException("The update manifest SHA-256 does not match the published SHA-256 asset.");
             }
 
-            return downloadedPath;
+            var cacheSnapshot = await _nodeCache.LoadAsync(cancellationToken);
+            var nodes = ResolveNodes(release.DownloadNodes, cacheSnapshot);
+            var failures = new List<string>();
+
+            foreach (var node in nodes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var downloadUrl = BuildNodeUrl(node, release.ExeDownloadUrl);
+                var probe = await ProbeNodeAsync(downloadUrl, release.ExeSize.Value, cancellationToken);
+                if (probe is null)
+                {
+                    failures.Add($"{node.Id}: probe failed");
+                    continue;
+                }
+
+                try
+                {
+                    await DownloadFromNodeWithRetryAsync(
+                        downloadUrl,
+                        downloadedPath,
+                        release.ExeSize.Value,
+                        probe.SupportsRanges,
+                        node.Id,
+                        progress,
+                        downloadControl,
+                        cancellationToken);
+
+                    var actualHash = await ComputeSha256Async(downloadedPath, cancellationToken);
+                    if (!CryptographicOperations.FixedTimeEquals(
+                            Convert.FromHexString(expectedHash),
+                            Convert.FromHexString(actualHash)))
+                    {
+                        throw new InvalidDataException("The downloaded update failed SHA-256 verification.");
+                    }
+
+                    await _nodeCache.SaveSuccessAsync(node.Id, probe.Latency, cancellationToken);
+                    return downloadedPath;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception exception) when (IsNodeFailure(exception))
+                {
+                    TryDeleteFile(downloadedPath);
+                    failures.Add($"{node.Id}: {SummarizeNodeFailure(exception)}");
+                }
+            }
+
+            throw new InvalidOperationException($"All update download nodes failed. {string.Join("; ", failures)}");
         }
         catch
         {
@@ -104,13 +175,16 @@ public sealed class UpdateClient
         var tagName = GetOptionalString(root, "tag") ?? $"v{version}";
         var releasePageUrl = GetOptionalString(root, "releaseNotesUrl")
             ?? $"https://github.com/{_options.Repository}/releases/tag/{Uri.EscapeDataString(tagName)}";
-
-        // Do not trust arbitrary URLs from the remote manifest. Construct the
-        // download endpoints from the configured repository and asset names.
-        var exeUrl = BuildLatestAssetUrl(assetName);
-        var shaUrl = BuildLatestAssetUrl(sha256AssetName);
         var releaseNotes = GetOptionalString(root, "releaseNotes") ?? string.Empty;
         var exeSize = GetOptionalInt64(root, "size");
+        var expectedSha256 = GetRequiredString(root, "sha256");
+        var nodes = ParseNodes(root);
+
+        // Download nodes must always receive a fixed tag URL rather than a
+        // latest-release URL, otherwise a release change during download could
+        // produce bytes that do not match this manifest's hash.
+        var exeUrl = BuildTaggedAssetUrl(tagName, assetName);
+        var shaUrl = BuildTaggedAssetUrl(tagName, sha256AssetName);
 
         return new UpdateRelease(
             version,
@@ -119,88 +193,275 @@ public sealed class UpdateClient
             releaseNotes,
             exeUrl,
             shaUrl,
-            exeSize);
+            exeSize,
+            expectedSha256,
+            nodes);
     }
 
-    private string BuildLatestAssetUrl(string assetName) =>
-        $"https://github.com/{_options.Repository}/releases/latest/download/{Uri.EscapeDataString(assetName)}";
+    private string BuildTaggedAssetUrl(string tagName, string assetName) =>
+        $"https://github.com/{_options.Repository}/releases/download/{Uri.EscapeDataString(tagName)}/{Uri.EscapeDataString(assetName)}";
 
-    private static Version GetCurrentVersion()
-    {
-        return ApplicationVersionProvider.GetCurrentVersion();
-    }
+    private static Version GetCurrentVersion() => ApplicationVersionProvider.GetCurrentVersion();
 
-    private static string GetRequiredString(JsonElement root, string propertyName)
+    private static IReadOnlyList<UpdateDownloadNode>? ParseNodes(JsonElement root)
     {
-        var value = GetOptionalString(root, propertyName);
-        if (string.IsNullOrWhiteSpace(value))
+        if (!root.TryGetProperty("downloadNodes", out var nodesElement)
+            || nodesElement.ValueKind != JsonValueKind.Array)
         {
-            throw new InvalidDataException($"Update manifest is missing {propertyName}.");
+            return null;
         }
 
-        return value;
-    }
-
-    private static string? GetOptionalString(JsonElement root, string propertyName)
-    {
-        return root.TryGetProperty(propertyName, out var property)
-            && property.ValueKind == JsonValueKind.String
-            ? property.GetString()?.Trim()
-            : null;
-    }
-
-    private static long? GetOptionalInt64(JsonElement root, string propertyName)
-    {
-        return root.TryGetProperty(propertyName, out var property)
-            && property.TryGetInt64(out var value)
-            ? value
-            : null;
-    }
-
-    private async Task DownloadFileAsync(
-        string url,
-        string destinationPath,
-        IProgress<UpdateDownloadProgress>? progress,
-        UpdateDownloadControl? downloadControl,
-        bool allowParallelDownload,
-        CancellationToken cancellationToken)
-    {
-        if (allowParallelDownload && _downloadOptions.EffectiveMaxConcurrentConnections > 1)
+        var nodes = new List<UpdateDownloadNode>();
+        foreach (var element in nodesElement.EnumerateArray())
         {
-            var remoteLength = await TryGetRangeLengthAsync(url, cancellationToken);
-            if (remoteLength >= _downloadOptions.EffectiveMinimumParallelDownloadBytes)
+            if (element.ValueKind != JsonValueKind.Object)
             {
-                try
-                {
-                    await DownloadInParallelAsync(url, destinationPath, remoteLength.Value, progress, downloadControl, cancellationToken);
-                    return;
-                }
-                catch (RangeDownloadNotSupportedException)
-                {
-                    TryDeleteFile(destinationPath);
-                }
+                continue;
+            }
+
+            var id = GetOptionalString(element, "id");
+            var template = GetOptionalString(element, "template");
+            var priority = GetOptionalInt32(element, "priority");
+            var enabled = GetOptionalBoolean(element, "enabled") ?? true;
+            if (id is not null && template is not null && priority is not null)
+            {
+                nodes.Add(new UpdateDownloadNode(id, template, priority.Value, enabled));
             }
         }
 
-        await DownloadSingleAsync(url, destinationPath, progress, downloadControl, cancellationToken);
+        return nodes;
     }
 
-    private async Task<long?> TryGetRangeLengthAsync(string url, CancellationToken cancellationToken)
+    private static IReadOnlyList<UpdateDownloadNode> NormalizeNodes(IReadOnlyList<UpdateDownloadNode>? nodes)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        response.EnsureSuccessStatusCode();
+        if (nodes is null)
+        {
+            return [];
+        }
 
-        return response.StatusCode == HttpStatusCode.PartialContent
-            ? response.Content.Headers.ContentRange?.Length
-            : null;
+        var result = new List<UpdateDownloadNode>();
+        var knownIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var node in nodes)
+        {
+            if (!TryNormalizeNode(node, out var normalized)
+                || !knownIds.Add(normalized.Id))
+            {
+                continue;
+            }
+
+            result.Add(normalized);
+        }
+
+        return result;
+    }
+
+    private static bool TryNormalizeNode(UpdateDownloadNode node, out UpdateDownloadNode normalized)
+    {
+        normalized = default!;
+        var id = node.Id?.Trim();
+        var template = node.Template?.Trim();
+        if (string.IsNullOrWhiteSpace(id)
+            || id.Length > 64
+            || id.Any(character => !char.IsLetterOrDigit(character) && character is not '-' and not '_')
+            || string.IsNullOrWhiteSpace(template)
+            || template.CountOccurrences("{url}") != 1)
+        {
+            return false;
+        }
+
+        if (string.Equals(id, "github-direct", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = new UpdateDownloadNode("github-direct", "{url}", 1000, true);
+            return true;
+        }
+
+        var candidate = template.Replace("{url}", "https://github.com/owner/repository/releases/download/v1.0.0/application.exe", StringComparison.Ordinal);
+        if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri)
+            || uri.Scheme != Uri.UriSchemeHttps)
+        {
+            return false;
+        }
+
+        normalized = new UpdateDownloadNode(id, template, Math.Clamp(node.Priority, -10_000, 10_000), node.Enabled);
+        return true;
+    }
+
+    private static IReadOnlyList<UpdateDownloadNode> ResolveNodes(
+        IReadOnlyList<UpdateDownloadNode>? remoteNodes,
+        UpdateNodeCacheSnapshot? cacheSnapshot)
+    {
+        var configuredNodes = NormalizeNodes(remoteNodes);
+        if (configuredNodes.Count == 0)
+        {
+            configuredNodes = NormalizeNodes(cacheSnapshot?.Nodes);
+        }
+
+        if (configuredNodes.Count == 0)
+        {
+            configuredNodes = NormalizeNodes(BuiltInNodes);
+        }
+
+        var directNode = BuiltInNodes.Single(node => node.Id == "github-direct");
+        var deduplicated = configuredNodes
+            .Where(node => !string.Equals(node.Id, directNode.Id, StringComparison.OrdinalIgnoreCase))
+            .Append(directNode)
+            .Where(node => node.Enabled)
+            .OrderBy(node => node.Priority)
+            .ToList();
+
+        if (!string.IsNullOrWhiteSpace(cacheSnapshot?.LastSuccessNodeId))
+        {
+            var successIndex = deduplicated.FindIndex(node => string.Equals(
+                node.Id,
+                cacheSnapshot.LastSuccessNodeId,
+                StringComparison.OrdinalIgnoreCase));
+            if (successIndex > 0)
+            {
+                var lastSuccess = deduplicated[successIndex];
+                deduplicated.RemoveAt(successIndex);
+                deduplicated.Insert(0, lastSuccess);
+            }
+        }
+
+        return deduplicated;
+    }
+
+    private static string BuildNodeUrl(UpdateDownloadNode node, string githubUrl) =>
+        node.Template.Replace("{url}", githubUrl, StringComparison.Ordinal);
+
+    private async Task<NodeProbeResult?> ProbeNodeAsync(
+        string url,
+        long expectedBytes,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            requestTimeout.CancelAfter(_downloadOptions.EffectiveProbeTimeout);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, Math.Min(ProbeByteCount - 1, expectedBytes - 1));
+            var stopwatch = Stopwatch.StartNew();
+            using var response = await _httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                requestTimeout.Token);
+
+            if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent
+                || IsHtml(response))
+            {
+                return null;
+            }
+
+            var supportsRanges = response.StatusCode == HttpStatusCode.PartialContent;
+            if (supportsRanges)
+            {
+                var contentRange = response.Content.Headers.ContentRange;
+                if (contentRange?.From != 0
+                    || contentRange.Length != expectedBytes
+                    || contentRange.To != Math.Min(ProbeByteCount - 1, expectedBytes - 1))
+                {
+                    return null;
+                }
+            }
+            else if (response.Content.Headers.ContentLength is long contentLength && contentLength != expectedBytes)
+            {
+                return null;
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(requestTimeout.Token);
+            var header = new byte[2];
+            var read = await stream.ReadAsync(header, requestTimeout.Token);
+            if (read != header.Length || header[0] != (byte)'M' || header[1] != (byte)'Z')
+            {
+                return null;
+            }
+
+            return new NodeProbeResult(supportsRanges, stopwatch.Elapsed);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private async Task DownloadFromNodeWithRetryAsync(
+        string url,
+        string destinationPath,
+        long expectedBytes,
+        bool supportsRanges,
+        string nodeId,
+        IProgress<UpdateDownloadProgress>? progress,
+        UpdateDownloadControl? downloadControl,
+        CancellationToken cancellationToken)
+    {
+        Exception? lastException = null;
+        for (var attempt = 0; attempt <= _downloadOptions.EffectiveMaxRetriesPerNode; attempt++)
+        {
+            TryDeleteFile(destinationPath);
+            try
+            {
+                if (supportsRanges && expectedBytes >= _downloadOptions.EffectiveMinimumParallelDownloadBytes)
+                {
+                    try
+                    {
+                        await DownloadInParallelAsync(
+                            url,
+                            destinationPath,
+                            expectedBytes,
+                            nodeId,
+                            progress,
+                            downloadControl,
+                            cancellationToken);
+                    }
+                    catch (RangeDownloadNotSupportedException)
+                    {
+                        TryDeleteFile(destinationPath);
+                        await DownloadSingleAsync(
+                            url,
+                            destinationPath,
+                            expectedBytes,
+                            progress,
+                            downloadControl,
+                            nodeId,
+                            cancellationToken);
+                    }
+                }
+                else
+                {
+                    await DownloadSingleAsync(
+                        url,
+                        destinationPath,
+                        expectedBytes,
+                        progress,
+                        downloadControl,
+                        nodeId,
+                        cancellationToken);
+                }
+
+                return;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception) when (IsNodeFailure(exception))
+            {
+                lastException = exception;
+            }
+        }
+
+        throw new NodeDownloadException("The node did not complete the update download after retrying once.", lastException);
     }
 
     private async Task DownloadInParallelAsync(
         string url,
         string destinationPath,
         long totalBytes,
+        string nodeId,
         IProgress<UpdateDownloadProgress>? progress,
         UpdateDownloadControl? downloadControl,
         CancellationToken cancellationToken)
@@ -215,7 +476,7 @@ public sealed class UpdateClient
             FileOptions.Asynchronous | FileOptions.RandomAccess);
         output.SetLength(totalBytes);
 
-        var reporter = new DownloadProgressReporter(progress, totalBytes);
+        var reporter = new DownloadProgressReporter(progress, totalBytes, nodeId);
         SafeFileHandle outputHandle = output.SafeFileHandle;
         var downloads = ranges.Select(range => DownloadRangeAsync(
             url,
@@ -242,8 +503,8 @@ public sealed class UpdateClient
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(range.Start, range.End);
-        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        if (response.StatusCode != HttpStatusCode.PartialContent)
+        using var response = await SendWithConnectTimeoutAsync(request, cancellationToken);
+        if (response.StatusCode != HttpStatusCode.PartialContent || IsHtml(response))
         {
             throw new RangeDownloadNotSupportedException();
         }
@@ -266,7 +527,7 @@ public sealed class UpdateClient
 
             var remaining = range.End - offset + 1;
             var requested = (int)Math.Min(buffer.Length, remaining);
-            var read = await input.ReadAsync(buffer.AsMemory(0, requested), cancellationToken);
+            var read = await ReadWithIdleTimeoutAsync(input, buffer.AsMemory(0, requested), cancellationToken);
             if (read == 0)
             {
                 throw new EndOfStreamException("The update server returned an incomplete byte range.");
@@ -281,19 +542,32 @@ public sealed class UpdateClient
     private async Task DownloadSingleAsync(
         string url,
         string destinationPath,
+        long? expectedBytes,
         IProgress<UpdateDownloadProgress>? progress,
         UpdateDownloadControl? downloadControl,
+        string nodeId,
         CancellationToken cancellationToken)
     {
-        using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        using var response = await SendWithConnectTimeoutAsync(request, cancellationToken);
         response.EnsureSuccessStatusCode();
+        if (IsHtml(response))
+        {
+            throw new NodeDownloadException("The node returned an HTML document instead of an executable.");
+        }
+
         var total = response.Content.Headers.ContentLength;
+        if (expectedBytes is long expected && total is long declared && declared != expected)
+        {
+            throw new InvalidDataException("The download node reported an unexpected file size.");
+        }
+
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-
         var buffer = new byte[_downloadOptions.EffectiveBufferBytes];
-        var reporter = new DownloadProgressReporter(progress, total);
-        int read;
+        var reporter = new DownloadProgressReporter(progress, expectedBytes ?? total, nodeId);
+        long copied = 0;
+        var validatedHeader = false;
         while (true)
         {
             if (downloadControl is not null)
@@ -301,18 +575,70 @@ public sealed class UpdateClient
                 await downloadControl.WaitIfPausedAsync(cancellationToken);
             }
 
-            read = await input.ReadAsync(buffer, cancellationToken);
+            var read = await ReadWithIdleTimeoutAsync(input, buffer, cancellationToken);
             if (read == 0)
             {
                 break;
             }
 
+            if (expectedBytes is not null && !validatedHeader)
+            {
+                if (read < 2 || buffer[0] != (byte)'M' || buffer[1] != (byte)'Z')
+                {
+                    throw new NodeDownloadException("The node returned data that is not a Windows executable.");
+                }
+
+                validatedHeader = true;
+            }
+
             await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            copied += read;
             reporter.Add(read);
+        }
+
+        if (expectedBytes is long expectedBytesValue && copied != expectedBytesValue)
+        {
+            throw new InvalidDataException("The downloaded update size does not match the manifest.");
         }
 
         reporter.Complete();
     }
+
+    private async Task<HttpResponseMessage> SendWithConnectTimeoutAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestTimeout.CancelAfter(_downloadOptions.EffectiveProbeTimeout);
+        return await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, requestTimeout.Token);
+    }
+
+    private async Task<int> ReadWithIdleTimeoutAsync(Stream input, Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        using var idleTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        idleTimeout.CancelAfter(_downloadOptions.EffectiveIdleTimeout);
+        return await input.ReadAsync(buffer, idleTimeout.Token);
+    }
+
+    private static bool IsHtml(HttpResponseMessage response) =>
+        response.Content.Headers.ContentType?.MediaType?.Contains("html", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool IsNodeFailure(Exception exception) => exception is
+        HttpRequestException or
+        IOException or
+        EndOfStreamException or
+        InvalidDataException or
+        NodeDownloadException or
+        RangeDownloadNotSupportedException or
+        OperationCanceledException;
+
+    private static string SummarizeNodeFailure(Exception exception) => exception switch
+    {
+        OperationCanceledException => "timeout",
+        HttpRequestException => "HTTP request failed",
+        InvalidDataException => "integrity check failed",
+        _ => "download failed"
+    };
 
     private static string ParseSha256(string text)
     {
@@ -322,7 +648,7 @@ public sealed class UpdateClient
 
         if (hashToken is null)
         {
-            throw new InvalidDataException("The SHA-256 asset has an invalid format.");
+            throw new InvalidDataException("The SHA-256 value has an invalid format.");
         }
 
         return hashToken.ToUpperInvariant();
@@ -334,6 +660,41 @@ public sealed class UpdateClient
         var hash = await SHA256.HashDataAsync(stream, cancellationToken);
         return Convert.ToHexString(hash);
     }
+
+    private static string GetRequiredString(JsonElement root, string propertyName)
+    {
+        var value = GetOptionalString(root, propertyName);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidDataException($"Update manifest is missing {propertyName}.");
+        }
+
+        return value;
+    }
+
+    private static string? GetOptionalString(JsonElement root, string propertyName) =>
+        root.TryGetProperty(propertyName, out var property)
+        && property.ValueKind == JsonValueKind.String
+            ? property.GetString()?.Trim()
+            : null;
+
+    private static long? GetOptionalInt64(JsonElement root, string propertyName) =>
+        root.TryGetProperty(propertyName, out var property)
+        && property.TryGetInt64(out var value)
+            ? value
+            : null;
+
+    private static int? GetOptionalInt32(JsonElement root, string propertyName) =>
+        root.TryGetProperty(propertyName, out var property)
+        && property.TryGetInt32(out var value)
+            ? value
+            : null;
+
+    private static bool? GetOptionalBoolean(JsonElement root, string propertyName) =>
+        root.TryGetProperty(propertyName, out var property)
+        && (property.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            ? property.GetBoolean()
+            : null;
 
     private static void TryDeleteDirectory(string path)
     {
@@ -382,25 +743,37 @@ public sealed class UpdateClient
         return ranges;
     }
 
+    private sealed record NodeProbeResult(bool SupportsRanges, TimeSpan Latency);
+
     private sealed record ByteRange(long Start, long End);
 
     private sealed class RangeDownloadNotSupportedException : Exception
     {
     }
 
+    private sealed class NodeDownloadException : Exception
+    {
+        public NodeDownloadException(string message, Exception? innerException = null)
+            : base(message, innerException)
+        {
+        }
+    }
+
     private sealed class DownloadProgressReporter
     {
         private readonly IProgress<UpdateDownloadProgress>? _progress;
         private readonly long? _totalBytes;
+        private readonly string _nodeId;
         private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
         private readonly object _sync = new();
         private long _bytesReceived;
         private TimeSpan _lastReport;
 
-        public DownloadProgressReporter(IProgress<UpdateDownloadProgress>? progress, long? totalBytes)
+        public DownloadProgressReporter(IProgress<UpdateDownloadProgress>? progress, long? totalBytes, string nodeId)
         {
             _progress = progress;
             _totalBytes = totalBytes;
+            _nodeId = nodeId;
         }
 
         public void Add(int byteCount)
@@ -431,8 +804,24 @@ public sealed class UpdateClient
 
             var bytesReceived = Interlocked.Read(ref _bytesReceived);
             var bytesPerSecond = bytesReceived / Math.Max(0.001, elapsed.TotalSeconds);
-            _progress.Report(new UpdateDownloadProgress(bytesReceived, _totalBytes, bytesPerSecond));
+            _progress.Report(new UpdateDownloadProgress(bytesReceived, _totalBytes, bytesPerSecond, _nodeId));
         }
+    }
+}
+
+internal static class StringExtensions
+{
+    public static int CountOccurrences(this string value, string token)
+    {
+        var count = 0;
+        var startIndex = 0;
+        while ((startIndex = value.IndexOf(token, startIndex, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            startIndex += token.Length;
+        }
+
+        return count;
     }
 }
 

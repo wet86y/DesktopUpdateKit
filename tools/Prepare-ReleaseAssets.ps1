@@ -59,6 +59,9 @@ $Manifest = [ordered]@{
     releaseNotesUrl = "https://github.com/$Repository/releases/tag/$TagName"
     releaseNotes = $ReleaseNotes
 }
+if ($null -ne $Config.downloadNodes) {
+    $Manifest.downloadNodes = @($Config.downloadNodes)
+}
 $Manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $AssetDirectory "update.json") -Encoding utf8
 
 Write-Host "Release assets prepared: $AssetDirectory"

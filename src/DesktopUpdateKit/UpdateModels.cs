@@ -16,7 +16,10 @@ public sealed record UpdateClientOptions(
 public sealed record UpdateDownloadOptions(
     int MaxConcurrentConnections = 4,
     long MinimumParallelDownloadBytes = 16L * 1024 * 1024,
-    int BufferBytes = 512 * 1024)
+    int BufferBytes = 512 * 1024,
+    TimeSpan? ProbeTimeout = null,
+    TimeSpan? IdleTimeout = null,
+    int MaxRetriesPerNode = 1)
 {
     internal int EffectiveMaxConcurrentConnections => Math.Clamp(MaxConcurrentConnections, 1, 4);
 
@@ -25,7 +28,28 @@ public sealed record UpdateDownloadOptions(
         MinimumParallelDownloadBytes);
 
     internal int EffectiveBufferBytes => Math.Clamp(BufferBytes, 64 * 1024, 1024 * 1024);
+
+    internal TimeSpan EffectiveProbeTimeout => ProbeTimeout is { } probeTimeout && probeTimeout > TimeSpan.Zero
+        ? probeTimeout
+        : TimeSpan.FromSeconds(5);
+
+    internal TimeSpan EffectiveIdleTimeout => IdleTimeout is { } idleTimeout && idleTimeout > TimeSpan.Zero
+        ? idleTimeout
+        : TimeSpan.FromSeconds(20);
+
+    internal int EffectiveMaxRetriesPerNode => Math.Clamp(MaxRetriesPerNode, 0, 1);
 }
+
+/// <summary>
+/// An update-package transport. The template must contain exactly one
+/// <c>{url}</c> marker, which is replaced with the tagged official GitHub
+/// Release asset URL.
+/// </summary>
+public sealed record UpdateDownloadNode(
+    string Id,
+    string Template,
+    int Priority,
+    bool Enabled = true);
 
 public sealed record UpdateRelease(
     Version Version,
@@ -34,12 +58,15 @@ public sealed record UpdateRelease(
     string ReleaseNotes,
     string ExeDownloadUrl,
     string Sha256DownloadUrl,
-    long? ExeSize);
+    long? ExeSize,
+    string ExpectedSha256,
+    IReadOnlyList<UpdateDownloadNode>? DownloadNodes = null);
 
 public sealed record UpdateDownloadProgress(
     long BytesReceived,
     long? TotalBytes,
-    double BytesPerSecond)
+    double BytesPerSecond,
+    string? NodeId = null)
 {
     public double? Fraction => TotalBytes is > 0
         ? (double)BytesReceived / TotalBytes.Value
