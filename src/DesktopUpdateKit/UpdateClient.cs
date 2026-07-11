@@ -398,50 +398,70 @@ public sealed class UpdateClient
         UpdateDownloadControl? downloadControl,
         CancellationToken cancellationToken)
     {
+        if (supportsRanges && expectedBytes >= _downloadOptions.EffectiveMinimumParallelDownloadBytes)
+        {
+            try
+            {
+                await DownloadInParallelAsync(
+                    url,
+                    destinationPath,
+                    expectedBytes,
+                    nodeId,
+                    progress,
+                    downloadControl,
+                    cancellationToken);
+                return;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception) when (IsNodeFailure(exception))
+            {
+                // A successful 64 KiB Range probe does not prove that a public
+                // node can sustain several concurrent ranges. Any parallel
+                // transport failure therefore degrades this same node to a
+                // single connection before another node is considered.
+                TryDeleteFile(destinationPath);
+            }
+        }
+
+        await DownloadSingleWithRetryAsync(
+            url,
+            destinationPath,
+            expectedBytes,
+            nodeId,
+            progress,
+            downloadControl,
+            isParallelFallback: supportsRanges,
+            cancellationToken);
+    }
+
+    private async Task DownloadSingleWithRetryAsync(
+        string url,
+        string destinationPath,
+        long expectedBytes,
+        string nodeId,
+        IProgress<UpdateDownloadProgress>? progress,
+        UpdateDownloadControl? downloadControl,
+        bool isParallelFallback,
+        CancellationToken cancellationToken)
+    {
         Exception? lastException = null;
         for (var attempt = 0; attempt <= _downloadOptions.EffectiveMaxRetriesPerNode; attempt++)
         {
             TryDeleteFile(destinationPath);
             try
             {
-                if (supportsRanges && expectedBytes >= _downloadOptions.EffectiveMinimumParallelDownloadBytes)
-                {
-                    try
-                    {
-                        await DownloadInParallelAsync(
-                            url,
-                            destinationPath,
-                            expectedBytes,
-                            nodeId,
-                            progress,
-                            downloadControl,
-                            cancellationToken);
-                    }
-                    catch (RangeDownloadNotSupportedException)
-                    {
-                        TryDeleteFile(destinationPath);
-                        await DownloadSingleAsync(
-                            url,
-                            destinationPath,
-                            expectedBytes,
-                            progress,
-                            downloadControl,
-                            nodeId,
-                            cancellationToken);
-                    }
-                }
-                else
-                {
-                    await DownloadSingleAsync(
-                        url,
-                        destinationPath,
-                        expectedBytes,
-                        progress,
-                        downloadControl,
-                        nodeId,
-                        cancellationToken);
-                }
-
+                await DownloadSingleAsync(
+                    url,
+                    destinationPath,
+                    expectedBytes,
+                    progress,
+                    downloadControl,
+                    nodeId,
+                    cancellationToken,
+                    isParallelFallback);
                 return;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -546,7 +566,8 @@ public sealed class UpdateClient
         IProgress<UpdateDownloadProgress>? progress,
         UpdateDownloadControl? downloadControl,
         string nodeId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool isParallelFallback = false)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         using var response = await SendWithConnectTimeoutAsync(request, cancellationToken);
@@ -565,7 +586,12 @@ public sealed class UpdateClient
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         var buffer = new byte[_downloadOptions.EffectiveBufferBytes];
-        var reporter = new DownloadProgressReporter(progress, expectedBytes ?? total, nodeId, connectionCount: 1);
+        var reporter = new DownloadProgressReporter(
+            progress,
+            expectedBytes ?? total,
+            nodeId,
+            connectionCount: 1,
+            isParallelFallback);
         long copied = 0;
         var validatedHeader = false;
         while (true)
@@ -765,6 +791,7 @@ public sealed class UpdateClient
         private readonly long? _totalBytes;
         private readonly string _nodeId;
         private readonly int _connectionCount;
+        private readonly bool _isParallelFallback;
         private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
         private readonly object _sync = new();
         private readonly Queue<(TimeSpan Timestamp, int Bytes)> _speedSamples = new();
@@ -776,12 +803,14 @@ public sealed class UpdateClient
             IProgress<UpdateDownloadProgress>? progress,
             long? totalBytes,
             string nodeId,
-            int connectionCount)
+            int connectionCount,
+            bool isParallelFallback = false)
         {
             _progress = progress;
             _totalBytes = totalBytes;
             _nodeId = nodeId;
             _connectionCount = Math.Max(1, connectionCount);
+            _isParallelFallback = isParallelFallback;
         }
 
         public void Add(int byteCount)
@@ -829,7 +858,8 @@ public sealed class UpdateClient
                 _totalBytes,
                 bytesPerSecond,
                 _nodeId,
-                _connectionCount));
+                _connectionCount,
+                _isParallelFallback));
         }
 
         private void TrimSpeedSamples(TimeSpan now)
