@@ -1,4 +1,5 @@
 using System.IO;
+using System.Diagnostics;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -19,12 +20,15 @@ public sealed class UpdateClient
         {
             NoCache = true
         };
+        _httpClient.Timeout = Timeout.InfiniteTimeSpan;
     }
 
     public async Task<UpdateRelease?> CheckForUpdateAsync(CancellationToken cancellationToken = default)
     {
         var manifestUrl = $"https://github.com/{_options.Repository}/releases/latest/download/update.json";
-        using var response = await _httpClient.GetAsync(manifestUrl, cancellationToken);
+        using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestTimeout.CancelAfter(TimeSpan.FromSeconds(20));
+        using var response = await _httpClient.GetAsync(manifestUrl, requestTimeout.Token);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         var release = await ParseManifestAsync(stream, cancellationToken);
@@ -33,7 +37,8 @@ public sealed class UpdateClient
 
     public async Task<string> DownloadAndVerifyAsync(
         UpdateRelease release,
-        IProgress<double>? progress = null,
+        IProgress<UpdateDownloadProgress>? progress = null,
+        UpdateDownloadControl? downloadControl = null,
         CancellationToken cancellationToken = default)
     {
         var tempDirectoryName = string.IsNullOrWhiteSpace(_options.TempDirectoryName)
@@ -47,8 +52,8 @@ public sealed class UpdateClient
 
         try
         {
-            await DownloadFileAsync(release.ExeDownloadUrl, downloadedPath, progress, cancellationToken);
-            await DownloadFileAsync(release.Sha256DownloadUrl, shaPath, null, cancellationToken);
+            await DownloadFileAsync(release.ExeDownloadUrl, downloadedPath, progress, downloadControl, cancellationToken);
+            await DownloadFileAsync(release.Sha256DownloadUrl, shaPath, null, null, cancellationToken);
 
             var expectedHash = ParseSha256(await File.ReadAllTextAsync(shaPath, cancellationToken));
             var actualHash = await ComputeSha256Async(downloadedPath, cancellationToken);
@@ -139,7 +144,8 @@ public sealed class UpdateClient
     private async Task DownloadFileAsync(
         string url,
         string destinationPath,
-        IProgress<double>? progress,
+        IProgress<UpdateDownloadProgress>? progress,
+        UpdateDownloadControl? downloadControl,
         CancellationToken cancellationToken)
     {
         using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
@@ -148,18 +154,34 @@ public sealed class UpdateClient
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
 
-        var buffer = new byte[128 * 1024];
+        var buffer = new byte[512 * 1024];
         long copied = 0;
+        var stopwatch = Stopwatch.StartNew();
+        var lastReport = TimeSpan.Zero;
         int read;
-        while ((read = await input.ReadAsync(buffer, cancellationToken)) > 0)
+        while (true)
         {
+            if (downloadControl is not null)
+            {
+                await downloadControl.WaitIfPausedAsync(cancellationToken);
+            }
+
+            read = await input.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
             await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
             copied += read;
-            if (total is > 0)
+            if (progress is not null && (stopwatch.Elapsed - lastReport >= TimeSpan.FromMilliseconds(120)))
             {
-                progress?.Report((double)copied / total.Value);
+                progress.Report(new UpdateDownloadProgress(copied, total, copied / Math.Max(0.001, stopwatch.Elapsed.TotalSeconds)));
+                lastReport = stopwatch.Elapsed;
             }
         }
+
+        progress?.Report(new UpdateDownloadProgress(copied, total, copied / Math.Max(0.001, stopwatch.Elapsed.TotalSeconds)));
     }
 
     private static string ParseSha256(string text)
