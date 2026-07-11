@@ -15,9 +15,15 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $ProjectRoot "release.config.json"
 }
 $Config = Get-Content -LiteralPath (Resolve-Path -LiteralPath $ConfigPath) -Raw | ConvertFrom-Json
+. (Join-Path $PSScriptRoot "ReleaseRules.ps1")
+Assert-ReleaseConfig -Config $Config
 $Version = $Version.TrimStart('v', 'V')
 $TagName = "v$Version"
 $AssetDirectory = Join-Path $ProjectRoot "build\release-assets\v$Version"
+$SharedRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+Assert-CleanGitWorktree -Root $ProjectRoot -Label "Project"
+Assert-CleanGitWorktree -Root $SharedRoot -Label "Shared update toolkit"
+Assert-PreparedReleaseAssets -AssetDirectory $AssetDirectory -Config $Config -Version $Version
 $Assets = @(
     (Join-Path $AssetDirectory $Config.releaseAssetName),
     (Join-Path $AssetDirectory "$($Config.releaseAssetName).sha256"),
@@ -38,4 +44,4 @@ if ($Finalize) {
     gh release edit $TagName --repo $Config.repository --draft=false
 }
 
-Write-Host "Release assets uploaded for $($Config.repository) $TagName"
+Write-Host "Release assets uploaded for $($Config.repository) $TagName. Source Git push is intentionally not performed."

@@ -14,6 +14,8 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 $SharedRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $PSScriptRoot "ReleaseRules.ps1")
+Assert-ReleaseConfig -Config $Config
 
 function Resolve-ProjectPath([string]$RelativePath) {
     $candidate = Join-Path $ProjectRoot $RelativePath

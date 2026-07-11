@@ -40,6 +40,12 @@
 
 `UpdateDownloadSession` 保存下载任务、暂停控制、进度、错误和已校验的临时 EXE 路径。窗口关闭不再销毁会话：默认调用 `PauseWhenUiCloses` 暂停下载；用户显式调用 `ContinueInBackground` 后，窗口可关闭而下载继续。后台下载完成后，调用方必须要求用户明确触发安装，不应在用户无感知时退出主程序。
 
+## 发布契约
+
+凡是接入 `DesktopUpdateKit` 的项目，其 `release.config.json` 必须声明 `downloadNodes`。每个节点必须包含 `id`、`template`、`priority` 和 `enabled`；模板仅允许一个 `{url}` 占位符，第三方节点必须为 HTTPS。节点列表必须包含固定的官方回退：`github-direct`、模板 `{url}`、`priority: 1000`、`enabled: true`。
+
+共享 `Build-Release.ps1`、`Prepare-ReleaseAssets.ps1` 和 `Publish-Release.ps1` 都会执行该校验。资产生成后还会校验 EXE 大小、EXE SHA-256、`.sha256` 文件、`update.json` 版本/Tag，以及清单内节点是否与项目配置完全一致。发布脚本还要求项目和共享工具两个本地 Git 工作区均无未提交改动；它只通过 `gh release` 上传 Release 资产，不执行源码 `git push`。
+
 ## 项目接入边界
 
 项目通过链接编译 `src\DesktopUpdateKit\UpdateClient.cs`、`UpdateModels.cs` 和 `UpdateLauncher.cs` 接入：

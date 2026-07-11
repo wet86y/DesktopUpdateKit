@@ -14,6 +14,8 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $ProjectRoot "release.config.json"
 }
 $Config = Get-Content -LiteralPath (Resolve-Path -LiteralPath $ConfigPath) -Raw | ConvertFrom-Json
+. (Join-Path $PSScriptRoot "ReleaseRules.ps1")
+Assert-ReleaseConfig -Config $Config
 $PublishedExe = Join-Path (Join-Path $ProjectRoot $Config.artifactsDirectory) $Config.publishedExeName
 
 if (-not (Test-Path -LiteralPath $PublishedExe)) {
@@ -63,5 +65,6 @@ if ($null -ne $Config.downloadNodes) {
     $Manifest.downloadNodes = @($Config.downloadNodes)
 }
 $Manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $AssetDirectory "update.json") -Encoding utf8
+Assert-PreparedReleaseAssets -AssetDirectory $AssetDirectory -Config $Config -Version $Version
 
 Write-Host "Release assets prepared: $AssetDirectory"
