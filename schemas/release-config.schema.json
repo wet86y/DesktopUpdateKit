@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DesktopUpdateKit release.config.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "applicationId",
+    "repository",
+    "publishedExeName",
+    "releaseAssetName",
+    "projectFile",
+    "artifactsDirectory",
+    "runtimeIdentifier",
+    "downloadNodes"
+  ],
+  "properties": {
+    "applicationId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "publishedExeName": { "type": "string", "minLength": 1 },
+    "releaseAssetName": { "type": "string", "minLength": 1 },
+    "projectFile": { "type": "string", "minLength": 1 },
+    "artifactsDirectory": { "type": "string", "minLength": 1 },
+    "runtimeIdentifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "enableSingleFileCompression": { "type": "boolean" },
+    "about": {
+      "$ref": "#/$defs/about"
+    },
+    "downloadNodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/downloadNode" },
+      "contains": {
+        "type": "object",
+        "properties": {
+          "id": { "const": "github-direct" },
+          "template": { "const": "{url}" },
+          "priority": { "const": 1000 },
+          "enabled": { "const": true }
+        },
+        "required": ["id", "template", "priority", "enabled"]
+      }
+    }
+  },
+  "$defs": {
+    "about": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1 },
+        "developer": { "type": "string", "minLength": 1 },
+        "historyUrl": { "type": "string", "format": "uri" },
+        "supportUrl": { "type": "string", "format": "uri" },
+        "licenseUrl": { "type": "string", "format": "uri" }
+      }
+    },
+    "downloadNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "template", "priority", "enabled"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,64}$"
+        },
+        "template": {
+          "type": "string",
+          "pattern": "^(\\{url\\}|https://[^\\s{}]+/\\{url\\})$"
+        },
+        "priority": { "type": "integer", "minimum": 0 },
+        "enabled": { "type": "boolean" }
+      }
+    }
+  }
+}

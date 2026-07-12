@@ -14,7 +14,39 @@ function Assert-ReleaseConfig {
         throw "release.config.json is missing required property: downloadNodes"
     }
 
+    Assert-AboutMetadata -About $Config.about
     Assert-DownloadNodes -Nodes $Config.downloadNodes
+}
+
+function Assert-AboutMetadata {
+    param(
+        [object]$About
+    )
+
+    if ($null -eq $About) {
+        return
+    }
+
+    foreach ($propertyName in @("displayName", "developer")) {
+        if ($null -eq $About.PSObject.Properties[$propertyName] -or [string]::IsNullOrWhiteSpace([string]$About.$propertyName)) {
+            throw "release.config.json about metadata is missing required property: $propertyName"
+        }
+    }
+
+    foreach ($propertyName in @("historyUrl", "supportUrl", "licenseUrl")) {
+        if ($null -ne $About.PSObject.Properties[$propertyName] -and -not [string]::IsNullOrWhiteSpace([string]$About.$propertyName)) {
+            try {
+                $uri = [uri]$About.$propertyName
+            }
+            catch {
+                throw "release.config.json about metadata contains an invalid URL: $propertyName"
+            }
+
+            if ($uri.Scheme -ne 'https') {
+                throw "release.config.json about metadata URLs must use HTTPS: $propertyName"
+            }
+        }
+    }
 }
 
 function Assert-DownloadNodes {
