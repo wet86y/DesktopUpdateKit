@@ -16,7 +16,8 @@ public sealed record UpdateDownloadSessionSnapshot(
     UpdateDownloadProgress? Progress,
     string? DownloadedPath,
     string? ErrorMessage,
-    bool ContinueInBackground);
+    bool ContinueInBackground,
+    bool UseAccelerationNodes);
 
 /// <summary>
 /// Process-lifetime update download state. UI windows may attach and detach
@@ -29,7 +30,7 @@ public sealed class UpdateDownloadSession : IDisposable
     private readonly UpdateClient _client;
     private UpdateDownloadControl? _control;
     private CancellationTokenSource? _cancellation;
-    private UpdateDownloadSessionSnapshot _snapshot = new(UpdateDownloadSessionState.Idle, null, null, null, null, false);
+    private UpdateDownloadSessionSnapshot _snapshot = new(UpdateDownloadSessionState.Idle, null, null, null, null, false, true);
     private bool _disposed;
 
     public UpdateDownloadSession(UpdateClient client)
@@ -50,7 +51,7 @@ public sealed class UpdateDownloadSession : IDisposable
         }
     }
 
-    public bool TryStart(UpdateRelease release)
+    public bool TryStart(UpdateRelease release, bool useAccelerationNodes)
     {
         ArgumentNullException.ThrowIfNull(release);
         lock (_sync)
@@ -64,13 +65,15 @@ public sealed class UpdateDownloadSession : IDisposable
             _cancellation?.Dispose();
             _cancellation = new CancellationTokenSource();
             _control = new UpdateDownloadControl();
+            _control.SetUseAccelerationNodes(useAccelerationNodes);
             _snapshot = new UpdateDownloadSessionSnapshot(
                 UpdateDownloadSessionState.Downloading,
                 release,
                 Progress: null,
                 DownloadedPath: null,
                 ErrorMessage: null,
-                ContinueInBackground: false);
+                ContinueInBackground: false,
+                UseAccelerationNodes: useAccelerationNodes);
             _ = RunAsync(release, _control, _cancellation);
         }
 
@@ -136,6 +139,36 @@ public sealed class UpdateDownloadSession : IDisposable
 
         RaiseChanged();
         return true;
+    }
+
+    public bool SetUseAccelerationNodes(bool enabled)
+    {
+        lock (_sync)
+        {
+            if (_snapshot.UseAccelerationNodes == enabled)
+            {
+                return false;
+            }
+
+            _snapshot = _snapshot with { UseAccelerationNodes = enabled };
+            _control?.SetUseAccelerationNodes(enabled);
+        }
+
+        RaiseChanged();
+        return true;
+    }
+
+    public bool RequestNextAcceleratedNode()
+    {
+        lock (_sync)
+        {
+            if (!_snapshot.UseAccelerationNodes || _control is null)
+            {
+                return false;
+            }
+
+            return _control.RequestNextAcceleratedNode();
+        }
     }
 
     public bool Cancel()

@@ -103,17 +103,31 @@ public sealed class UpdateClient
             }
 
             var cacheSnapshot = await _nodeCache.LoadAsync(cancellationToken);
-            var nodes = ResolveNodes(release.DownloadNodes, cacheSnapshot);
+            var usingAccelerationNodes = downloadControl?.UseAccelerationNodes ?? true;
+            var nodes = ResolveNodes(release.DownloadNodes, cacheSnapshot, usingAccelerationNodes);
             var failures = new List<string>();
-
-            foreach (var node in nodes)
+            var nodeIndex = 0;
+            while (nodeIndex < nodes.Count)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                var node = nodes[nodeIndex];
                 var downloadUrl = BuildNodeUrl(node, release.ExeDownloadUrl);
-                var probe = await ProbeNodeAsync(downloadUrl, release.ExeSize.Value, cancellationToken);
+                using var nodeAttemptCancellation = downloadControl is null
+                    ? null
+                    : CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellationToken,
+                        downloadControl.GetNodeSwitchToken());
+                var nodeCancellationToken = nodeAttemptCancellation?.Token ?? cancellationToken;
+                var probe = await ProbeNodeAsync(downloadUrl, release.ExeSize.Value, nodeCancellationToken);
                 if (probe is null)
                 {
+                    if (TryApplyNodeSwitchRequest(downloadControl, usingAccelerationNodes, release.DownloadNodes, ref nodes, ref nodeIndex, ref usingAccelerationNodes, cacheSnapshot))
+                    {
+                        continue;
+                    }
+
                     failures.Add($"{node.Id}: probe failed");
+                    nodeIndex++;
                     continue;
                 }
 
@@ -127,7 +141,7 @@ public sealed class UpdateClient
                         node.Id,
                         progress,
                         downloadControl,
-                        cancellationToken);
+                        nodeCancellationToken);
 
                     var actualHash = await ComputeSha256Async(downloadedPath, cancellationToken);
                     if (!CryptographicOperations.FixedTimeEquals(
@@ -147,7 +161,13 @@ public sealed class UpdateClient
                 catch (Exception exception) when (IsNodeFailure(exception))
                 {
                     TryDeleteFile(downloadedPath);
+                    if (TryApplyNodeSwitchRequest(downloadControl, usingAccelerationNodes, release.DownloadNodes, ref nodes, ref nodeIndex, ref usingAccelerationNodes, cacheSnapshot))
+                    {
+                        continue;
+                    }
+
                     failures.Add($"{node.Id}: {SummarizeNodeFailure(exception)}");
+                    nodeIndex++;
                 }
             }
 
@@ -288,8 +308,15 @@ public sealed class UpdateClient
 
     private static IReadOnlyList<UpdateDownloadNode> ResolveNodes(
         IReadOnlyList<UpdateDownloadNode>? remoteNodes,
-        UpdateNodeCacheSnapshot? cacheSnapshot)
+        UpdateNodeCacheSnapshot? cacheSnapshot,
+        bool useAccelerationNodes)
     {
+        var directNode = BuiltInNodes.Single(node => node.Id == "github-direct");
+        if (!useAccelerationNodes)
+        {
+            return [directNode];
+        }
+
         var configuredNodes = NormalizeNodes(remoteNodes);
         if (configuredNodes.Count == 0)
         {
@@ -301,7 +328,6 @@ public sealed class UpdateClient
             configuredNodes = NormalizeNodes(BuiltInNodes);
         }
 
-        var directNode = BuiltInNodes.Single(node => node.Id == "github-direct");
         var deduplicated = configuredNodes
             .Where(node => !string.Equals(node.Id, directNode.Id, StringComparison.OrdinalIgnoreCase))
             .Append(directNode)
@@ -324,6 +350,48 @@ public sealed class UpdateClient
         }
 
         return deduplicated;
+    }
+
+    private static bool TryApplyNodeSwitchRequest(
+        UpdateDownloadControl? control,
+        bool wasUsingAccelerationNodes,
+        IReadOnlyList<UpdateDownloadNode>? remoteNodes,
+        ref IReadOnlyList<UpdateDownloadNode> nodes,
+        ref int nodeIndex,
+        ref bool usingAccelerationNodes,
+        UpdateNodeCacheSnapshot? cacheSnapshot)
+    {
+        if (control is null)
+        {
+            return false;
+        }
+
+        var request = control.ConsumeNodeSwitchRequest(wasUsingAccelerationNodes);
+        if (request == UpdateNodeSwitchRequest.None)
+        {
+            return false;
+        }
+
+        usingAccelerationNodes = control.UseAccelerationNodes;
+        nodes = ResolveNodes(remoteNodes, cacheSnapshot, usingAccelerationNodes);
+        nodeIndex = request == UpdateNodeSwitchRequest.NextAcceleratedNode
+            ? FindNextAcceleratedNodeIndex(nodes, nodeIndex)
+            : 0;
+        return nodeIndex >= 0 && nodeIndex < nodes.Count;
+    }
+
+    private static int FindNextAcceleratedNodeIndex(IReadOnlyList<UpdateDownloadNode> nodes, int currentIndex)
+    {
+        for (var offset = 1; offset <= nodes.Count; offset++)
+        {
+            var index = (currentIndex + offset) % nodes.Count;
+            if (!string.Equals(nodes[index].Id, "github-direct", StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     private static string BuildNodeUrl(UpdateDownloadNode node, string githubUrl) =>

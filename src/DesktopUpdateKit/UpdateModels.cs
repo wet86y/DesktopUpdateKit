@@ -75,10 +75,19 @@ public sealed record UpdateDownloadProgress(
         : null;
 }
 
+public enum UpdateNodeSwitchRequest
+{
+    None,
+    NextAcceleratedNode,
+    UseGitHubDirect
+}
+
 public sealed class UpdateDownloadControl
 {
     private readonly object _sync = new();
     private TaskCompletionSource? _resumeSignal;
+    private CancellationTokenSource _nodeSwitchCancellation = new();
+    private bool _useAccelerationNodes = true;
 
     public bool IsPaused
     {
@@ -88,6 +97,45 @@ public sealed class UpdateDownloadControl
             {
                 return _resumeSignal is not null;
             }
+        }
+    }
+
+    public bool UseAccelerationNodes
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _useAccelerationNodes;
+            }
+        }
+    }
+
+    public void SetUseAccelerationNodes(bool enabled)
+    {
+        lock (_sync)
+        {
+            if (_useAccelerationNodes == enabled)
+            {
+                return;
+            }
+
+            _useAccelerationNodes = enabled;
+            _nodeSwitchCancellation.Cancel();
+        }
+    }
+
+    public bool RequestNextAcceleratedNode()
+    {
+        lock (_sync)
+        {
+            if (!_useAccelerationNodes || _nodeSwitchCancellation.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            _nodeSwitchCancellation.Cancel();
+            return true;
         }
     }
 
@@ -125,6 +173,32 @@ public sealed class UpdateDownloadControl
         }
 
         return waitTask.WaitAsync(cancellationToken);
+    }
+
+    internal CancellationToken GetNodeSwitchToken()
+    {
+        lock (_sync)
+        {
+            return _nodeSwitchCancellation.Token;
+        }
+    }
+
+    internal UpdateNodeSwitchRequest ConsumeNodeSwitchRequest(bool wasUsingAccelerationNodes)
+    {
+        lock (_sync)
+        {
+            if (!_nodeSwitchCancellation.IsCancellationRequested)
+            {
+                return UpdateNodeSwitchRequest.None;
+            }
+
+            var request = _useAccelerationNodes
+                ? UpdateNodeSwitchRequest.NextAcceleratedNode
+                : UpdateNodeSwitchRequest.UseGitHubDirect;
+            _nodeSwitchCancellation.Dispose();
+            _nodeSwitchCancellation = new CancellationTokenSource();
+            return request;
+        }
     }
 }
 
