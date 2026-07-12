@@ -10,6 +10,7 @@
 - 任意分块未返回正确的 `206 Partial Content` 或 `Content-Range` 时，自动删除不完整文件并退回单连接下载。
 - 所有下载最终仍校验完整 EXE 的 SHA-256；分块完成不代表更新可信。
 - `UpdateDownloadControl` 提供暂停/继续控制；取消由调用方的 `CancellationToken` 终止，并清理本次临时目录。
+- `UpdateLauncher.EnsureCanonicalExecutableNameAsync` 可在启动阶段通过同一个内嵌 NativeAOT Stub 完成 EXE 改名、重启和健康检查；调用方不应在 UI 线程同步等待会捕获 UI 上下文的异步实现。
 
 当前版本不会在应用退出或取消后保留 `.part` 文件，因此尚不提供跨进程断点续传。若以后加入持久断点、镜像择优、增量补丁或测速回退，均必须在本目录内实现，并保持完整 EXE + SHA-256 回退路径。
 

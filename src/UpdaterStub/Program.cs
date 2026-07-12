@@ -10,6 +10,17 @@ internal static class Program
     {
         try
         {
+            var renameTransactionPath = GetArgument(args, "--rename-transaction");
+            if (!string.IsNullOrWhiteSpace(renameTransactionPath))
+            {
+                var renameTransaction = JsonSerializer.Deserialize(
+                    File.ReadAllText(renameTransactionPath),
+                    UpdaterStubJsonContext.Default.ExecutableRenameTransaction)
+                    ?? throw new InvalidDataException("The executable rename transaction is empty.");
+
+                return RunRename(renameTransaction, renameTransactionPath);
+            }
+
             var transactionPath = GetArgument(args, "--transaction")
                 ?? throw new ArgumentException("Missing --transaction.");
             var transaction = JsonSerializer.Deserialize(
@@ -23,6 +34,49 @@ internal static class Program
         {
             Console.Error.WriteLine(ex.Message);
             return 10;
+        }
+    }
+
+    private static int RunRename(ExecutableRenameTransaction transaction, string transactionPath)
+    {
+        if (!WaitForExit(transaction.ParentProcessId, transaction.ParentExitTimeoutSeconds))
+        {
+            return 20;
+        }
+
+        var sourcePath = transaction.SourceExePath;
+        var targetPath = transaction.TargetExePath;
+        var targetWasPresent = File.Exists(targetPath);
+
+        try
+        {
+            if (targetWasPresent)
+            {
+                File.Move(targetPath, transaction.BackupExePath, overwrite: false);
+            }
+
+            File.Move(sourcePath, targetPath, overwrite: false);
+            var process = StartTarget(targetPath, transaction.HealthMarkerPath);
+            if (!WaitForHealth(process, transaction.HealthMarkerPath, transaction.HealthTimeoutSeconds))
+            {
+                TryTerminate(process);
+                RestoreRenamedExecutable(transaction, targetWasPresent);
+                TryStartOriginalApplication(sourcePath);
+                ScheduleSelfCleanup();
+                return 30;
+            }
+
+            TryDelete(transaction.BackupExePath);
+            TryDeleteDirectory(Path.GetDirectoryName(transactionPath));
+            ScheduleSelfCleanup();
+            return 0;
+        }
+        catch
+        {
+            RestoreRenamedExecutable(transaction, targetWasPresent);
+            TryStartOriginalApplication(sourcePath);
+            ScheduleSelfCleanup();
+            return 40;
         }
     }
 
@@ -123,6 +177,33 @@ internal static class Program
         }
     }
 
+    private static void RestoreRenamedExecutable(ExecutableRenameTransaction transaction, bool targetWasPresent)
+    {
+        try
+        {
+            if (File.Exists(transaction.TargetExePath))
+            {
+                if (!File.Exists(transaction.SourceExePath))
+                {
+                    File.Move(transaction.TargetExePath, transaction.SourceExePath, overwrite: false);
+                }
+                else
+                {
+                    TryDelete(transaction.TargetExePath);
+                }
+            }
+
+            if (targetWasPresent && File.Exists(transaction.BackupExePath))
+            {
+                File.Move(transaction.BackupExePath, transaction.TargetExePath, overwrite: false);
+            }
+        }
+        catch
+        {
+            // Keep whichever executable remains for manual recovery.
+        }
+    }
+
     private static void TryStartRestoredApplication(string targetPath)
     {
         try
@@ -138,6 +219,27 @@ internal static class Program
         catch
         {
             // The backup remains on disk for manual recovery.
+        }
+    }
+
+    private static void TryStartOriginalApplication(string sourcePath)
+    {
+        try
+        {
+            if (File.Exists(sourcePath))
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = sourcePath,
+                    WorkingDirectory = Path.GetDirectoryName(sourcePath) ?? string.Empty,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+            }
+        }
+        catch
+        {
+            // The original executable remains on disk for manual recovery.
         }
     }
 
@@ -233,6 +335,16 @@ internal sealed record UpdateTransaction(
     int ParentExitTimeoutSeconds,
     int HealthTimeoutSeconds);
 
+internal sealed record ExecutableRenameTransaction(
+    int ParentProcessId,
+    string SourceExePath,
+    string TargetExePath,
+    string BackupExePath,
+    string HealthMarkerPath,
+    int ParentExitTimeoutSeconds,
+    int HealthTimeoutSeconds);
+
 [JsonSourceGenerationOptions(WriteIndented = false)]
 [JsonSerializable(typeof(UpdateTransaction))]
+[JsonSerializable(typeof(ExecutableRenameTransaction))]
 internal partial class UpdaterStubJsonContext : JsonSerializerContext;

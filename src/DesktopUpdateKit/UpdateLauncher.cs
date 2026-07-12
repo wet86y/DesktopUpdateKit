@@ -46,7 +46,7 @@ public sealed class UpdateLauncher
         var healthMarkerPath = Path.Combine(updateDirectory, "healthy.ok");
         var backupPath = Path.Combine(targetDirectory, $".{Path.GetFileName(targetExePath)}.{transactionId}.bak");
 
-        await ExtractStubAsync(stubPath, cancellationToken);
+        await ExtractStubAsync(stubPath, cancellationToken).ConfigureAwait(false);
         var transaction = new UpdateTransaction(
             Environment.ProcessId,
             Path.GetFullPath(targetExePath),
@@ -56,7 +56,7 @@ public sealed class UpdateLauncher
         await File.WriteAllTextAsync(
             transactionPath,
             JsonSerializer.Serialize(transaction, new JsonSerializerOptions { WriteIndented = true }),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
 
         var startInfo = new ProcessStartInfo
         {
@@ -74,6 +74,77 @@ public sealed class UpdateLauncher
         }
     }
 
+    public async Task<bool> EnsureCanonicalExecutableNameAsync(
+        string canonicalFileName,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(canonicalFileName)
+            || !string.Equals(Path.GetExtension(canonicalFileName), ".exe", StringComparison.OrdinalIgnoreCase)
+            || canonicalFileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            throw new ArgumentException("The canonical executable name is invalid.", nameof(canonicalFileName));
+        }
+
+        var currentExePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(currentExePath)
+            || !Path.IsPathFullyQualified(currentExePath)
+            || !File.Exists(currentExePath))
+        {
+            return false;
+        }
+
+        if (string.Equals(Path.GetFileName(currentExePath), canonicalFileName, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var targetDirectory = Path.GetDirectoryName(currentExePath);
+        if (string.IsNullOrWhiteSpace(targetDirectory))
+        {
+            return false;
+        }
+
+        var updateDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "DesktopUpdateKit-name-normalize",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(updateDirectory);
+        var stubPath = Path.Combine(updateDirectory, "UpdaterStub.exe");
+        var transactionPath = Path.Combine(updateDirectory, "rename.json");
+        var healthMarkerPath = Path.Combine(updateDirectory, "healthy.ok");
+        var targetExePath = Path.Combine(targetDirectory, canonicalFileName);
+        var backupPath = Path.Combine(targetDirectory, $".{canonicalFileName}.{Guid.NewGuid():N}.bak");
+
+        await ExtractStubAsync(stubPath, cancellationToken).ConfigureAwait(false);
+        var transaction = new ExecutableRenameTransaction(
+            Environment.ProcessId,
+            Path.GetFullPath(currentExePath),
+            Path.GetFullPath(targetExePath),
+            backupPath,
+            healthMarkerPath);
+        await File.WriteAllTextAsync(
+            transactionPath,
+            JsonSerializer.Serialize(transaction, new JsonSerializerOptions { WriteIndented = true }),
+            cancellationToken).ConfigureAwait(false);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = stubPath,
+            WorkingDirectory = updateDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("--rename-transaction");
+        startInfo.ArgumentList.Add(transactionPath);
+
+        if (Process.Start(startInfo) is null)
+        {
+            throw new InvalidOperationException("UpdaterStub could not be started for executable name normalization.");
+        }
+
+        return true;
+    }
+
     private static async Task ExtractStubAsync(string destinationPath, CancellationToken cancellationToken)
     {
         var assembly = Assembly.GetEntryAssembly()
@@ -83,7 +154,7 @@ public sealed class UpdateLauncher
                 "UpdaterStub is not embedded in this build. Use the shared release publishing script first.");
 
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-        await resource.CopyToAsync(output, cancellationToken);
+        await resource.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
     }
 
     private static void EnsureDirectoryWritable(string directory)
@@ -117,3 +188,12 @@ public sealed class UpdateLauncher
         }
     }
 }
+
+internal sealed record ExecutableRenameTransaction(
+    int ParentProcessId,
+    string SourceExePath,
+    string TargetExePath,
+    string BackupExePath,
+    string HealthMarkerPath,
+    int ParentExitTimeoutSeconds = 30,
+    int HealthTimeoutSeconds = 30);
