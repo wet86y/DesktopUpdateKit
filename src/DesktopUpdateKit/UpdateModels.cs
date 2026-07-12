@@ -78,6 +78,7 @@ public sealed record UpdateDownloadProgress(
 public enum UpdateNodeSwitchRequest
 {
     None,
+    UseAccelerationNodes,
     NextAcceleratedNode,
     UseGitHubDirect
 }
@@ -192,9 +193,13 @@ public sealed class UpdateDownloadControl
                 return UpdateNodeSwitchRequest.None;
             }
 
-            var request = _useAccelerationNodes
-                ? UpdateNodeSwitchRequest.NextAcceleratedNode
-                : UpdateNodeSwitchRequest.UseGitHubDirect;
+            var request = _useAccelerationNodes == wasUsingAccelerationNodes
+                ? (_useAccelerationNodes
+                    ? UpdateNodeSwitchRequest.NextAcceleratedNode
+                    : UpdateNodeSwitchRequest.None)
+                : (_useAccelerationNodes
+                    ? UpdateNodeSwitchRequest.UseAccelerationNodes
+                    : UpdateNodeSwitchRequest.UseGitHubDirect);
             _nodeSwitchCancellation.Dispose();
             _nodeSwitchCancellation = new CancellationTokenSource();
             return request;
