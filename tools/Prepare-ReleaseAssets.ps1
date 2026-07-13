@@ -37,6 +37,19 @@ $AssetName = $Config.releaseAssetName
 $AssetPath = Join-Path $AssetDirectory $AssetName
 Copy-Item -LiteralPath $PublishedExe -Destination $AssetPath
 
+$LicenseAssets = @{
+    "LICENSE" = (Join-Path $ProjectRoot "LICENSE")
+    "NOTICE" = (Join-Path $ProjectRoot "NOTICE")
+    "THIRD-PARTY-NOTICES.md" = (Join-Path $ProjectRoot "THIRD-PARTY-NOTICES.md")
+    "DesktopUpdateKit-LICENSE.txt" = (Join-Path $PSScriptRoot "..\LICENSE")
+}
+foreach ($entry in $LicenseAssets.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value)) {
+        throw "Required license file not found: $($entry.Value)"
+    }
+    Copy-Item -LiteralPath $entry.Value -Destination (Join-Path $AssetDirectory $entry.Key)
+}
+
 $Hash = (Get-FileHash -LiteralPath $AssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $Sha256Name = "$AssetName.sha256"
 Set-Content -LiteralPath (Join-Path $AssetDirectory $Sha256Name) -Value "$Hash  $AssetName" -Encoding ascii

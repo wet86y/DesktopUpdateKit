@@ -151,7 +151,13 @@ function Assert-PreparedReleaseAssets {
     $assetPath = Join-Path $AssetDirectory $assetName
     $shaPath = Join-Path $AssetDirectory "$assetName.sha256"
     $manifestPath = Join-Path $AssetDirectory 'update.json'
-    foreach ($path in @($assetPath, $shaPath, $manifestPath)) {
+    $licensePaths = @(
+        (Join-Path $AssetDirectory 'LICENSE'),
+        (Join-Path $AssetDirectory 'NOTICE'),
+        (Join-Path $AssetDirectory 'THIRD-PARTY-NOTICES.md'),
+        (Join-Path $AssetDirectory 'DesktopUpdateKit-LICENSE.txt')
+    )
+    foreach ($path in @($assetPath, $shaPath, $manifestPath) + $licensePaths) {
         if (-not (Test-Path -LiteralPath $path)) {
             throw "Prepared release asset not found: $path"
         }

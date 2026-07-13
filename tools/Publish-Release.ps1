@@ -27,7 +27,11 @@ Assert-PreparedReleaseAssets -AssetDirectory $AssetDirectory -Config $Config -Ve
 $Assets = @(
     (Join-Path $AssetDirectory $Config.releaseAssetName),
     (Join-Path $AssetDirectory "$($Config.releaseAssetName).sha256"),
-    (Join-Path $AssetDirectory "update.json")
+    (Join-Path $AssetDirectory "update.json"),
+    (Join-Path $AssetDirectory "LICENSE"),
+    (Join-Path $AssetDirectory "NOTICE"),
+    (Join-Path $AssetDirectory "THIRD-PARTY-NOTICES.md"),
+    (Join-Path $AssetDirectory "DesktopUpdateKit-LICENSE.txt")
 )
 
 foreach ($asset in $Assets) {
