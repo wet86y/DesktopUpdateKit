@@ -1,5 +1,9 @@
 # DesktopUpdateKit
 
+DesktopUpdateKit 是用于 Windows 桌面单 EXE 应用的共享更新组件，源码采用
+[MIT License](LICENSE)。代码来源说明见 [PROVENANCE.md](PROVENANCE.md)，NativeAOT
+发布涉及的第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
 本目录是 `D:\项目开发` 下多个 Windows 单 EXE 项目共用的本地更新工具。
 
 包含：
