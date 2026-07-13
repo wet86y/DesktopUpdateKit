@@ -22,6 +22,10 @@ if (-not (Test-Path -LiteralPath $PublishedExe)) {
     throw "Published EXE not found. Run the shared Build-Release.ps1 first."
 }
 
+Invoke-ReleaseExecutableVerification `
+    -ExecutablePath $PublishedExe `
+    -Arguments $Config.releaseVerificationArguments
+
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = (Get-Item -LiteralPath $PublishedExe).VersionInfo.ProductVersion
 }

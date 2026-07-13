@@ -13,9 +13,58 @@ function Assert-ReleaseConfig {
     if ($null -eq $Config.PSObject.Properties["downloadNodes"]) {
         throw "release.config.json is missing required property: downloadNodes"
     }
+    if ($null -eq $Config.PSObject.Properties["releaseVerificationArguments"]) {
+        throw "release.config.json is missing required property: releaseVerificationArguments"
+    }
 
     Assert-AboutMetadata -About $Config.about
     Assert-DownloadNodes -Nodes $Config.downloadNodes
+    Assert-ReleaseVerificationArguments -Arguments $Config.releaseVerificationArguments
+}
+
+function Assert-ReleaseVerificationArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Arguments
+    )
+
+    $argumentList = @($Arguments)
+    if ($argumentList.Count -eq 0 -or $argumentList.Count -gt 8) {
+        throw "releaseVerificationArguments must contain between 1 and 8 entries."
+    }
+
+    foreach ($argument in $argumentList) {
+        if ([string]$argument -notmatch '^--[A-Za-z0-9][A-Za-z0-9-]{0,63}$') {
+            throw "releaseVerificationArguments contains an invalid switch: $argument"
+        }
+    }
+}
+
+function Invoke-ReleaseExecutableVerification {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutablePath,
+        [Parameter(Mandatory = $true)]
+        [object]$Arguments
+    )
+
+    if (-not (Test-Path -LiteralPath $ExecutablePath)) {
+        throw "Release executable not found: $ExecutablePath"
+    }
+
+    Assert-ReleaseVerificationArguments -Arguments $Arguments
+    foreach ($argument in @($Arguments)) {
+        $process = Start-Process -FilePath $ExecutablePath `
+            -ArgumentList ([string]$argument) `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "Release executable verification '$argument' failed with exit code $($process.ExitCode)."
+        }
+    }
+
+    Write-Host "Release executable verification passed: $(@($Arguments) -join ', ')"
 }
 
 function Assert-AboutMetadata {

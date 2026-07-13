@@ -47,7 +47,7 @@
 
 凡是接入 `DesktopUpdateKit` 的项目，其 `release.config.json` 必须声明 `downloadNodes`。每个节点必须包含 `id`、`template`、`priority` 和 `enabled`；模板仅允许一个 `{url}` 占位符，第三方节点必须为 HTTPS。节点列表必须包含固定的官方回退：`github-direct`、模板 `{url}`、`priority: 1000`、`enabled: true`。
 
-共享 `Build-Release.ps1`、`Prepare-ReleaseAssets.ps1` 和 `Publish-Release.ps1` 都会执行该校验。资产生成后还会校验 EXE 大小、EXE SHA-256、`.sha256` 文件、`update.json` 版本/Tag，以及清单内节点是否与项目配置完全一致。发布脚本还要求项目和共享工具两个本地 Git 工作区均无未提交改动；它只通过 `gh release` 上传 Release 资产，不执行源码 `git push`。
+共享 `Build-Release.ps1`、`Prepare-ReleaseAssets.ps1` 和 `Publish-Release.ps1` 都会执行该校验。构建脚本会先清理宿主 Release 增量输出，防止未嵌入 UpdaterStub 的普通构建程序集被发布复用。宿主还必须通过 `releaseVerificationArguments` 声明最终 EXE 自检开关；构建后和资产准备前都会运行并要求退出码为 0。资产生成后还会校验 EXE 大小、EXE SHA-256、`.sha256` 文件、`update.json` 版本/Tag，以及清单内节点是否与项目配置完全一致。发布脚本还要求项目和共享工具两个本地 Git 工作区均无未提交改动；它只通过 `gh release` 上传 Release 资产，不执行源码 `git push`。
 
 ## 项目接入边界
 

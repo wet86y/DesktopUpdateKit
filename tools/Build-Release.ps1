@@ -38,6 +38,12 @@ foreach ($path in @($Project, $UpdaterProject)) {
     }
 }
 
+Write-Host "Cleaning host Release outputs to prevent stale incremental assemblies..."
+dotnet clean $Project -c Release
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 foreach ($path in @($Artifacts, $UpdaterOutput)) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Recurse -Force
@@ -85,5 +91,9 @@ $ProjectPublishArguments += @("-o", $Artifacts)
 if (-not (Test-Path -LiteralPath $ExpectedExe)) {
     throw "Release executable was not produced: $ExpectedExe"
 }
+
+Invoke-ReleaseExecutableVerification `
+    -ExecutablePath $ExpectedExe `
+    -Arguments $Config.releaseVerificationArguments
 
 Write-Host "Done. Output: $Artifacts"
