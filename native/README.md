@@ -1,8 +1,8 @@
-# DesktopUpdateKit native candidate
+# DesktopUpdateKit native runtime
 
-This directory is a C++20/Win32 candidate implementation of the runtime
-download client and updater stub. It is intentionally not referenced by the
-current C# host projects or PowerShell release tooling.
+This directory is the C++20/Win32 implementation of the runtime download client
+and updater stub used by the Super Middle Key native migration build. It remains
+independent from the current C# host projects and formal PowerShell release tooling.
 
 Build and test it independently from this repository root:
 
@@ -12,7 +12,8 @@ cmake --build .\build\native --config Release --parallel
 ctest --test-dir .\build\native -C Release --output-on-failure
 ```
 
-The candidate preserves the update manifest, transaction JSON and command-line
-contracts used by the managed implementation. It must not be used for a formal
-Release or embedded into a host application until the later joint integration
-phase with Super Middle Key is complete.
+The native runtime preserves the managed update manifest, transaction JSON and
+command-line contracts. It provides streaming WinHTTP transfers, strict Range
+validation with parallel-to-single fallback, node failover, pause/cancel control,
+SHA-256 verification, health-confirmed replacement and rollback. Formal product
+release remains gated by the host application's migration acceptance process.
