@@ -256,6 +256,8 @@ int wmain() {
         expect(!session.start(*slow_release), "a duplicate start is rejected while downloading");
         const auto elapsed = std::chrono::steady_clock::now() - began;
         expect(elapsed < std::chrono::milliseconds(100), "duplicate start never waits for the active worker");
+        expect(!session.set_acceleration(true),
+            "setting the active acceleration mode is idempotent at the session boundary");
         expect(session.pause(), "active session can be paused");
         expect(session.snapshot().state == SessionState::paused, "paused session publishes its state");
         expect(session.continue_in_background(), "paused session can continue in the background");

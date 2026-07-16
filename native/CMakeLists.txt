@@ -16,6 +16,7 @@ add_library(desktop_update_kit_native STATIC
     src/UpdateKit.cpp
 )
 target_include_directories(desktop_update_kit_native PUBLIC include)
+target_include_directories(desktop_update_kit_native PRIVATE src)
 target_compile_definitions(desktop_update_kit_native PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(desktop_update_kit_native PRIVATE /W4 /permissive- /utf-8 /EHsc)
 target_link_libraries(desktop_update_kit_native PRIVATE bcrypt winhttp)
@@ -33,6 +34,7 @@ if(BUILD_TESTING)
     add_executable(desktop_update_kit_native_tests tests/NativeTests.cpp)
     target_compile_definitions(desktop_update_kit_native_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(desktop_update_kit_native_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_include_directories(desktop_update_kit_native_tests PRIVATE src)
     target_link_libraries(desktop_update_kit_native_tests PRIVATE desktop_update_kit_native)
     add_test(NAME desktop_update_kit_native COMMAND desktop_update_kit_native_tests $<TARGET_FILE:DesktopUpdateKitUpdaterStub> $<TARGET_FILE:desktop_update_kit_native_test_host>)
 

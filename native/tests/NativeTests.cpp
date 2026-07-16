@@ -1,4 +1,5 @@
 #include "DesktopUpdateKit/UpdateKit.h"
+#include "NodeSelection.h"
 
 #include <windows.h>
 
@@ -63,7 +64,34 @@ int wmain(int argc, wchar_t** argv) {
     expect(!control.paused(), "resume changes state");
     control.use_acceleration(false);
     expect(!control.acceleration_enabled(), "direct node mode is remembered");
-    expect(control.consume_node_switch(), "mode switch requests a new node");
+    expect(control.consume_node_switch_request() == NodeSwitchRequest::use_official_node,
+        "disabling acceleration requests the official node");
+    int interrupts{};
+    control.set_interrupt([&interrupts] { ++interrupts; });
+    control.use_acceleration(false);
+    expect(control.consume_node_switch_request() == NodeSwitchRequest::none,
+        "setting the existing acceleration mode is idempotent");
+    expect(interrupts == 0, "an idempotent acceleration setting does not interrupt the active request");
+    control.use_acceleration(true);
+    expect(interrupts == 1, "changing acceleration interrupts the active request once");
+    expect(control.consume_node_switch_request() == NodeSwitchRequest::use_acceleration_nodes,
+        "enabling acceleration requests the accelerated node list");
+    expect(control.next_accelerated_node(), "manual accelerated-node switching is accepted");
+    expect(control.consume_node_switch_request() == NodeSwitchRequest::next_accelerated_node,
+        "manual switching retains its distinct request type");
+
+    const std::vector<DownloadNode> nodes{
+        {"accelerated-a", "https://a.invalid/{url}", 10, true},
+        {"accelerated-b", "https://b.invalid/{url}", 20, true},
+        {"github-direct", "{url}", 1000, true},
+    };
+    expect(detail::next_accelerated_node_index(nodes, 0) == 1,
+        "manual switching advances to the next accelerated node");
+    expect(detail::next_accelerated_node_index(nodes, 1) == 0,
+        "manual switching wraps without selecting GitHub direct");
+    expect(detail::next_accelerated_node_index(
+        std::span<const DownloadNode>(nodes).subspan(2), 0) == 1,
+        "manual switching reports when no accelerated node is available");
 
     const auto root = std::filesystem::temp_directory_path() / L"desktop-update-kit-native-tests";
     std::error_code ignored;
