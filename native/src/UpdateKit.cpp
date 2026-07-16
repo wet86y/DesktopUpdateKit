@@ -1,6 +1,7 @@
 #include "DesktopUpdateKit/UpdateKit.h"
 
 #include "Json.h"
+#include "NodeSelection.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -26,6 +27,17 @@
 #include <tuple>
 
 namespace desktop_update_kit {
+
+std::size_t detail::next_accelerated_node_index(
+    std::span<const DownloadNode> nodes, std::size_t current_index) noexcept {
+    if (nodes.empty()) return 0;
+    for (std::size_t offset = 1; offset <= nodes.size(); ++offset) {
+        const auto index = (current_index + offset) % nodes.size();
+        if (nodes[index].id != "github-direct") return index;
+    }
+    return nodes.size();
+}
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -812,13 +824,38 @@ std::shared_ptr<HttpTransport> make_winhttp_transport(std::wstring user_agent) {
 void DownloadControl::pause() { std::scoped_lock lock(mutex_); if (!cancelled_) paused_ = true; }
 void DownloadControl::resume() { { std::scoped_lock lock(mutex_); paused_ = false; } resume_signal_.notify_all(); }
 void DownloadControl::cancel() { { std::scoped_lock lock(mutex_); cancelled_ = true; paused_ = false; } resume_signal_.notify_all(); request_interrupt(); }
-void DownloadControl::use_acceleration(bool enabled) { { std::scoped_lock lock(mutex_); acceleration_ = enabled; } switch_node_ = true; request_interrupt(); }
-bool DownloadControl::next_accelerated_node() { { std::scoped_lock lock(mutex_); if (!acceleration_ || cancelled_) return false; } switch_node_ = true; request_interrupt(); return true; }
+void DownloadControl::use_acceleration(bool enabled) {
+    {
+        std::scoped_lock lock(mutex_);
+        if (cancelled_ || acceleration_ == enabled) return;
+        acceleration_ = enabled;
+        node_switch_request_ = enabled
+            ? NodeSwitchRequest::use_acceleration_nodes
+            : NodeSwitchRequest::use_official_node;
+    }
+    request_interrupt();
+}
+bool DownloadControl::next_accelerated_node() {
+    {
+        std::scoped_lock lock(mutex_);
+        if (!acceleration_ || cancelled_) return false;
+        node_switch_request_ = NodeSwitchRequest::next_accelerated_node;
+    }
+    request_interrupt();
+    return true;
+}
 bool DownloadControl::cancelled() const { std::scoped_lock lock(mutex_); return cancelled_; }
 bool DownloadControl::paused() const { std::scoped_lock lock(mutex_); return paused_; }
 bool DownloadControl::acceleration_enabled() const { std::scoped_lock lock(mutex_); return acceleration_; }
-bool DownloadControl::node_switch_requested() const noexcept { return switch_node_.load(); }
-bool DownloadControl::consume_node_switch() { return switch_node_.exchange(false); }
+bool DownloadControl::node_switch_requested() const noexcept {
+    return node_switch_request_.load() != NodeSwitchRequest::none;
+}
+NodeSwitchRequest DownloadControl::consume_node_switch_request() {
+    return node_switch_request_.exchange(NodeSwitchRequest::none);
+}
+bool DownloadControl::consume_node_switch() {
+    return consume_node_switch_request() != NodeSwitchRequest::none;
+}
 void DownloadControl::wait_if_paused(std::stop_token token) const {
     std::unique_lock lock(mutex_);
     resume_signal_.wait(lock, token, [&] { return !paused_ || cancelled_; });
@@ -926,15 +963,22 @@ std::filesystem::path UpdateClient::download_and_verify(const Release& release, 
             } catch (...) {
                 last_error = std::current_exception();
                 if (control.cancelled() || token.stop_requested()) throw;
-                if (control.consume_node_switch()) {
+                const auto switch_request = control.consume_node_switch_request();
+                if (switch_request != NodeSwitchRequest::none) {
                     auto refreshed = resolve_nodes(options_, release, control.acceleration_enabled());
-                    const auto current = std::find_if(refreshed.begin(), refreshed.end(), [&](const DownloadNode& candidate) {
-                        return candidate.id == node.id;
-                    });
-                    index = current == refreshed.end() || refreshed.size() < 2
-                        ? 0
-                        : (static_cast<std::size_t>(std::distance(refreshed.begin(), current)) + 1) % refreshed.size();
+                    if (switch_request == NodeSwitchRequest::next_accelerated_node) {
+                        const auto current = std::find_if(refreshed.begin(), refreshed.end(), [&](const DownloadNode& candidate) {
+                            return candidate.id == node.id;
+                        });
+                        const auto current_index = current == refreshed.end()
+                            ? refreshed.size() - 1
+                            : static_cast<std::size_t>(std::distance(refreshed.begin(), current));
+                        index = detail::next_accelerated_node_index(refreshed, current_index);
+                    } else {
+                        index = 0;
+                    }
                     nodes = std::move(refreshed);
+                    if (index >= nodes.size()) throw std::runtime_error("No accelerated download node is available");
                 } else {
                     ++index;
                 }
@@ -1035,6 +1079,7 @@ bool DownloadSession::cancel() {
 
 bool DownloadSession::set_acceleration(bool enabled) {
     if (!control_) return false;
+    { std::scoped_lock lock(mutex_); if (snapshot_.acceleration == enabled) return false; }
     control_->use_acceleration(enabled);
     { std::scoped_lock lock(mutex_); snapshot_.acceleration = enabled; }
     notify();

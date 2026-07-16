@@ -108,6 +108,13 @@ struct DownloadProgress {
 
 enum class SessionState { idle, downloading, paused, completed, failed, cancelled };
 
+enum class NodeSwitchRequest {
+    none,
+    use_acceleration_nodes,
+    use_official_node,
+    next_accelerated_node,
+};
+
 struct SessionSnapshot {
     SessionState state{SessionState::idle};
     std::optional<Release> release;
@@ -129,6 +136,7 @@ public:
     [[nodiscard]] bool paused() const;
     [[nodiscard]] bool acceleration_enabled() const;
     [[nodiscard]] bool node_switch_requested() const noexcept;
+    NodeSwitchRequest consume_node_switch_request();
     bool consume_node_switch();
     void wait_if_paused(std::stop_token token) const;
     void set_interrupt(std::function<void()> interrupt);
@@ -140,7 +148,7 @@ private:
     bool paused_{};
     bool cancelled_{};
     bool acceleration_{true};
-    std::atomic_bool switch_node_{};
+    std::atomic<NodeSwitchRequest> node_switch_request_{NodeSwitchRequest::none};
     std::function<void()> interrupt_;
 };
 
