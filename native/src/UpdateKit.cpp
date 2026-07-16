@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 namespace desktop_update_kit {
 
@@ -728,12 +729,28 @@ std::string path_json(const std::filesystem::path& path) { return json_escape(na
 bool write_text_atomic(const std::filesystem::path& path, const std::string& value, std::string& error) {
     try {
         std::filesystem::create_directories(path.parent_path());
-        const auto temporary = path.wstring() + L".tmp";
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        output.write(value.data(), static_cast<std::streamsize>(value.size()));
-        output.close();
-        if (!output) throw std::runtime_error("Unable to write transaction");
-        std::filesystem::rename(temporary, path);
+        const auto temporary = path.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(GetTickCount64()) + L".tmp";
+        HANDLE output = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (output == INVALID_HANDLE_VALUE) throw std::runtime_error("Unable to create transaction");
+        DWORD offset{};
+        bool ok = true;
+        while (offset < value.size()) {
+            DWORD written{};
+            const auto remaining = static_cast<DWORD>(std::min<std::size_t>(value.size() - offset, MAXDWORD));
+            if (!WriteFile(output, value.data() + offset, remaining, &written, nullptr) || written == 0) {
+                ok = false;
+                break;
+            }
+            offset += written;
+        }
+        ok = ok && FlushFileBuffers(output) != FALSE;
+        CloseHandle(output);
+        if (!ok || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temporary.c_str());
+            throw std::runtime_error("Unable to commit transaction");
+        }
         return true;
     } catch (const std::exception& exception) {
         error = exception.what();
@@ -789,6 +806,8 @@ LaunchResult launch_common(std::span<const std::byte> stub, const std::filesyste
         result.started = true;
     } catch (const std::exception& exception) {
         result.error = exception.what();
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
     }
     return result;
 }
@@ -995,20 +1014,54 @@ std::filesystem::path UpdateClient::download_and_verify(const Release& release, 
 }
 
 DownloadSession::DownloadSession(UpdateClient client) : client_(std::move(client)) {}
-DownloadSession::~DownloadSession() { cancel(); if (worker_.joinable()) worker_.join(); }
+
+struct DownloadSession::CallbackSlot {
+    std::recursive_mutex mutex;
+    bool active{true};
+    std::function<void(const SessionSnapshot&)> callback;
+};
+
+DownloadSession::~DownloadSession() {
+    set_changed_callback({});
+    cancel();
+    if (worker_.joinable()) worker_.join();
+}
+
+void UpdateClient::cancel_active_requests() noexcept {
+    if (transport_) transport_->abort_active();
+}
 
 void DownloadSession::set_changed_callback(std::function<void(const SessionSnapshot&)> callback) {
-    std::scoped_lock lock(mutex_);
-    changed_ = std::move(callback);
+    auto replacement = callback ? std::make_shared<CallbackSlot>() : std::shared_ptr<CallbackSlot>{};
+    if (replacement) replacement->callback = std::move(callback);
+    std::shared_ptr<CallbackSlot> prior;
+    {
+        std::scoped_lock lock(mutex_);
+        prior = std::exchange(changed_, std::move(replacement));
+    }
+    if (prior) {
+        std::scoped_lock lock(prior->mutex);
+        prior->active = false;
+        prior->callback = {};
+    }
 }
 
 SessionSnapshot DownloadSession::snapshot() const { std::scoped_lock lock(mutex_); return snapshot_; }
 
 void DownloadSession::notify() {
-    std::function<void(const SessionSnapshot&)> callback;
+    std::shared_ptr<CallbackSlot> callback;
     SessionSnapshot copy;
     { std::scoped_lock lock(mutex_); callback = changed_; copy = snapshot_; }
-    if (callback) callback(copy);
+    if (callback) {
+        std::scoped_lock lock(callback->mutex);
+        if (callback->active && callback->callback) {
+            try {
+                callback->callback(copy);
+            } catch (...) {
+                // A UI observer must never terminate the download worker.
+            }
+        }
+    }
 }
 
 bool DownloadSession::start(Release release, bool acceleration) {
@@ -1023,12 +1076,19 @@ bool DownloadSession::start(Release release, bool acceleration) {
         control_->use_acceleration(acceleration);
         (void)control_->consume_node_switch();
         snapshot_ = {SessionState::downloading, release, {}, {}, {}, false, acceleration};
+        worker_finished_ = false;
     }
     worker_ = std::jthread([this, release](std::stop_token token) {
+        auto last_progress_notification = std::chrono::steady_clock::time_point::min();
         try {
-            auto path = client_.download_and_verify(release, *control_, [this](const DownloadProgress& value) {
+            auto path = client_.download_and_verify(release, *control_, [this, &last_progress_notification](const DownloadProgress& value) {
                 { std::scoped_lock lock(mutex_); snapshot_.progress = value; }
-                notify();
+                const auto now = std::chrono::steady_clock::now();
+                if (last_progress_notification == std::chrono::steady_clock::time_point::min() ||
+                    now - last_progress_notification >= 100ms || value.received == value.total) {
+                    last_progress_notification = now;
+                    notify();
+                }
             }, token);
             { std::scoped_lock lock(mutex_); snapshot_.state = SessionState::completed; snapshot_.downloaded_path = std::move(path); }
         } catch (const std::exception& exception) {
@@ -1037,6 +1097,11 @@ bool DownloadSession::start(Release release, bool acceleration) {
             snapshot_.error = exception.what();
         }
         notify();
+        {
+            std::scoped_lock lock(mutex_);
+            worker_finished_ = true;
+        }
+        worker_finished_signal_.notify_all();
     });
     notify();
     return true;
@@ -1077,6 +1142,21 @@ bool DownloadSession::cancel() {
     return true;
 }
 
+bool DownloadSession::wait_for_stop(std::chrono::milliseconds timeout) {
+    cancel();
+    std::unique_lock lock(mutex_);
+    bool finished{};
+    if (timeout == std::chrono::milliseconds::max()) {
+        worker_finished_signal_.wait(lock, [this] { return worker_finished_; });
+        finished = true;
+    } else {
+        finished = worker_finished_signal_.wait_for(lock, timeout, [this] { return worker_finished_; });
+    }
+    lock.unlock();
+    if (finished && worker_.joinable()) worker_.join();
+    return finished;
+}
+
 bool DownloadSession::set_acceleration(bool enabled) {
     if (!control_) return false;
     { std::scoped_lock lock(mutex_); if (snapshot_.acceleration == enabled) return false; }
@@ -1104,8 +1184,13 @@ std::optional<UpdateTransaction> read_update_transaction(const std::filesystem::
         if (!common_transaction_fields(*object, transaction.parent_process_id, transaction.target_exe, transaction.backup_exe,
                 transaction.health_marker, transaction.parent_exit_timeout_seconds, transaction.health_timeout_seconds, error)) return {};
         const auto* downloaded = json::string(json::member(*object, "DownloadedExePath"));
-        if (!downloaded) { error = "Transaction missing DownloadedExePath"; return {}; }
+        const auto* expected_sha256 = json::string(json::member(*object, "ExpectedSha256"));
+        if (!downloaded || !expected_sha256 || !valid_sha256(*expected_sha256)) {
+            error = "Transaction missing a valid downloaded path or SHA-256";
+            return {};
+        }
         transaction.downloaded_exe = wide(*downloaded);
+        transaction.expected_sha256 = *expected_sha256;
         if (!transaction.downloaded_exe.is_absolute()) { error = "Transaction paths must be absolute"; return {}; }
         return transaction;
     } catch (const std::exception& exception) { error = exception.what(); return {}; }
@@ -1131,6 +1216,7 @@ std::optional<RenameTransaction> read_rename_transaction(const std::filesystem::
 bool write_update_transaction(const std::filesystem::path& path, const UpdateTransaction& transaction, std::string& error) {
     const auto body = "{\"ParentProcessId\":" + std::to_string(transaction.parent_process_id) +
         ",\"TargetExePath\":\"" + path_json(transaction.target_exe) + "\",\"DownloadedExePath\":\"" + path_json(transaction.downloaded_exe) +
+        "\",\"ExpectedSha256\":\"" + transaction.expected_sha256 +
         "\",\"BackupExePath\":\"" + path_json(transaction.backup_exe) + "\",\"HealthMarkerPath\":\"" + path_json(transaction.health_marker) +
         "\",\"ParentExitTimeoutSeconds\":" + std::to_string(transaction.parent_exit_timeout_seconds) +
         ",\"HealthTimeoutSeconds\":" + std::to_string(transaction.health_timeout_seconds) + "}";
@@ -1147,18 +1233,27 @@ bool write_rename_transaction(const std::filesystem::path& path, const RenameTra
 }
 
 LaunchResult launch_update(std::span<const std::byte> stub, const std::filesystem::path& downloaded,
-    const std::filesystem::path& target, int parent_process_id) {
-    if (!target.is_absolute() || !downloaded.is_absolute() || !std::filesystem::exists(downloaded) || !writable_directory(target.parent_path()))
+    const std::filesystem::path& target, std::string expected_sha256, int parent_process_id) {
+    if (!target.is_absolute() || !downloaded.is_absolute() || !std::filesystem::exists(downloaded) ||
+        !valid_sha256(expected_sha256) || !writable_directory(target.parent_path()))
         return {false, {}, "The program directory is not writable or the downloaded file is missing"};
+    std::transform(expected_sha256.begin(), expected_sha256.end(), expected_sha256.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
     const auto directory = std::filesystem::temp_directory_path() / L"DesktopUpdateKit-native" /
         (std::to_wstring(parent_process_id) + L"-" + std::to_wstring(GetTickCount64()));
     const auto transaction_path = directory / L"update.json";
     UpdateTransaction transaction{parent_process_id, std::filesystem::absolute(target), std::filesystem::absolute(downloaded),
+        std::move(expected_sha256),
         target.parent_path() / (L"." + target.filename().wstring() + L"." + std::to_wstring(GetTickCount64()) + L".bak"),
         directory / L"healthy.ok", 30, 30};
     std::string error;
     const auto body_path = directory / L"body.json";
-    if (!write_update_transaction(body_path, transaction, error)) return {false, directory, error};
+    if (!write_update_transaction(body_path, transaction, error)) {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+        return {false, directory, error};
+    }
     const auto body = read_file(body_path);
     std::error_code ignored;
     std::filesystem::remove(body_path, ignored);
@@ -1177,7 +1272,11 @@ LaunchResult launch_rename(std::span<const std::byte> stub, const std::filesyste
         directory / L"healthy.ok", 30, 30};
     std::string error;
     const auto body_path = directory / L"body.json";
-    if (!write_rename_transaction(body_path, transaction, error)) return {false, directory, error};
+    if (!write_rename_transaction(body_path, transaction, error)) {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+        return {false, directory, error};
+    }
     const auto body = read_file(body_path);
     std::error_code ignored;
     std::filesystem::remove(body_path, ignored);

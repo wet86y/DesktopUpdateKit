@@ -2,10 +2,15 @@
 #include "NodeSelection.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
+#include <vector>
 
 using namespace desktop_update_kit;
 
@@ -24,6 +29,40 @@ std::filesystem::path write_text(const std::filesystem::path& path, const std::s
     std::ofstream output(path, std::ios::binary);
     output << body;
     return path;
+}
+
+std::string sha256_file(const std::filesystem::path& path) {
+    BCRYPT_ALG_HANDLE algorithm{};
+    BCRYPT_HASH_HANDLE hash{};
+    DWORD object_size{};
+    DWORD bytes{};
+    std::vector<UCHAR> object;
+    std::array<UCHAR, 32> digest{};
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
+        BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size),
+            sizeof(object_size), &bytes, 0) < 0) return {};
+    object.resize(object_size);
+    if (BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) < 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+    std::ifstream input(path, std::ios::binary);
+    std::vector<char> buffer(1024 * 1024);
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count > 0 && BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()),
+                static_cast<ULONG>(count), 0) < 0) break;
+    }
+    const bool completed = input.eof() &&
+        BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0;
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!completed) return {};
+    std::ostringstream output;
+    for (const auto byte : digest)
+        output << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+    return output.str();
 }
 
 int run(const std::filesystem::path& program, const std::wstring& arguments, DWORD timeout = 15000) {
@@ -45,7 +84,7 @@ void write_update(const std::filesystem::path& transaction_path, const std::file
     const std::filesystem::path& downloaded, const std::filesystem::path& backup,
     const std::filesystem::path& marker, int health_seconds = 3) {
     UpdateTransaction transaction{999999, std::filesystem::absolute(target), std::filesystem::absolute(downloaded),
-        std::filesystem::absolute(backup), std::filesystem::absolute(marker), 1, health_seconds};
+        sha256_file(downloaded), std::filesystem::absolute(backup), std::filesystem::absolute(marker), 1, health_seconds};
     std::string error;
     expect(write_update_transaction(transaction_path, transaction, error), "native update transaction can be written");
 }
@@ -98,7 +137,7 @@ int wmain(int argc, wchar_t** argv) {
     std::filesystem::remove_all(root, ignored);
     std::filesystem::create_directories(root);
     const auto transaction = root / L"shape.json";
-    write_text(transaction, R"({"ParentProcessId":1,"TargetExePath":"C:\\temp\\app.exe","DownloadedExePath":"C:\\temp\\new.exe","BackupExePath":"C:\\temp\\app.bak","HealthMarkerPath":"C:\\temp\\healthy.ok","ParentExitTimeoutSeconds":30,"HealthTimeoutSeconds":30})");
+    write_text(transaction, R"({"ParentProcessId":1,"TargetExePath":"C:\\temp\\app.exe","DownloadedExePath":"C:\\temp\\new.exe","ExpectedSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","BackupExePath":"C:\\temp\\app.bak","HealthMarkerPath":"C:\\temp\\healthy.ok","ParentExitTimeoutSeconds":30,"HealthTimeoutSeconds":30})");
     std::string error;
     auto update = read_update_transaction(transaction, error);
     expect(update.has_value(), "managed update transaction shape remains readable");
@@ -110,7 +149,9 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 3) {
         const auto source_stub = std::filesystem::absolute(argv[1]);
         const auto test_host = std::filesystem::absolute(argv[2]);
+#if defined(DUK_DIAGNOSTICS)
         SetEnvironmentVariableW(L"DUK_KEEP_TRANSACTION", L"1");
+#endif
 
         const auto success = root / L"success target";
         const auto success_tx = root / L"success transaction";
@@ -128,9 +169,32 @@ int wmain(int argc, wchar_t** argv) {
         write_update(live_transaction, target, downloaded, backup, marker);
         expect(run(stub, L"--transaction \"" + live_transaction.wstring() + L"\"") == 0,
             "native stub replaces and health-checks a test host");
+#if defined(DUK_DIAGNOSTICS)
         expect(std::filesystem::exists(marker), "test host wrote native health marker");
+#endif
         expect(std::filesystem::exists(target), "native stub left target executable in place");
         expect(!std::filesystem::exists(backup), "native stub removed backup after healthy launch");
+
+        const auto mismatch = root / L"hash mismatch";
+        const auto mismatch_tx = root / L"hash mismatch transaction";
+        std::filesystem::create_directories(mismatch);
+        std::filesystem::create_directories(mismatch_tx);
+        const auto mismatch_target = write_text(mismatch / L"target.exe", "original");
+        const auto mismatch_downloaded = write_text(mismatch / L"downloaded.exe", "replacement");
+        const auto mismatch_transaction = mismatch_tx / L"update.json";
+        const auto mismatch_stub = mismatch_tx / L"UpdaterStub.exe";
+        UpdateTransaction mismatch_body{999999, std::filesystem::absolute(mismatch_target),
+            std::filesystem::absolute(mismatch_downloaded), std::string(64, '0'),
+            std::filesystem::absolute(mismatch / L"target.bak"),
+            std::filesystem::absolute(mismatch_tx / L"healthy.ok"), 1, 1};
+        std::filesystem::copy_file(source_stub, mismatch_stub);
+        expect(write_update_transaction(mismatch_transaction, mismatch_body, error),
+            "mismatch transaction can be written");
+        expect(run(mismatch_stub, L"--transaction \"" + mismatch_transaction.wstring() + L"\"") == 40,
+            "native stub rejects a payload whose SHA-256 changed");
+        std::ifstream mismatch_result(mismatch_target, std::ios::binary);
+        expect(std::string(std::istreambuf_iterator<char>(mismatch_result), {}) == "original",
+            "SHA mismatch leaves the installed target untouched");
 
         const auto missing = root / L"missing target";
         const auto missing_tx = root / L"missing transaction";
@@ -170,7 +234,9 @@ int wmain(int argc, wchar_t** argv) {
         SetEnvironmentVariableW(L"DUK_TEST_FAIL_HEALTH", nullptr);
         expect(std::filesystem::exists(rollback_target), "rollback restored the original executable");
         expect(!std::filesystem::exists(rollback_backup), "rollback consumed the backup");
+#if defined(DUK_DIAGNOSTICS)
         SetEnvironmentVariableW(L"DUK_KEEP_TRANSACTION", nullptr);
+#endif
 
         const auto cleanup = root / L"cleanup target";
         const auto cleanup_tx = root / L"cleanup transaction";

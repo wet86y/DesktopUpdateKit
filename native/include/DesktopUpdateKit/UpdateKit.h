@@ -158,6 +158,7 @@ public:
     std::optional<Release> check_for_update(std::stop_token token = {}) const;
     std::filesystem::path download_and_verify(const Release& release, DownloadControl& control,
         std::function<void(const DownloadProgress&)> progress = {}, std::stop_token token = {}) const;
+    void cancel_active_requests() noexcept;
 
 private:
     ClientOptions options_;
@@ -177,23 +178,28 @@ public:
     bool set_acceleration(bool enabled);
     bool next_accelerated_node();
     void discard_completed();
+    bool wait_for_stop(std::chrono::milliseconds timeout);
     [[nodiscard]] SessionSnapshot snapshot() const;
     void set_changed_callback(std::function<void(const SessionSnapshot&)> callback);
 
 private:
+    struct CallbackSlot;
     void notify();
     UpdateClient client_;
     std::unique_ptr<DownloadControl> control_;
     std::jthread worker_;
     mutable std::mutex mutex_;
+    std::condition_variable worker_finished_signal_;
+    bool worker_finished_{true};
     SessionSnapshot snapshot_;
-    std::function<void(const SessionSnapshot&)> changed_;
+    std::shared_ptr<CallbackSlot> changed_;
 };
 
 struct UpdateTransaction {
     int parent_process_id{};
     std::filesystem::path target_exe;
     std::filesystem::path downloaded_exe;
+    std::string expected_sha256;
     std::filesystem::path backup_exe;
     std::filesystem::path health_marker;
     int parent_exit_timeout_seconds{30};
@@ -222,7 +228,7 @@ struct LaunchResult {
 };
 
 LaunchResult launch_update(std::span<const std::byte> updater_stub, const std::filesystem::path& downloaded_exe,
-    const std::filesystem::path& target_exe, int parent_process_id);
+    const std::filesystem::path& target_exe, std::string expected_sha256, int parent_process_id);
 LaunchResult launch_rename(std::span<const std::byte> updater_stub, const std::filesystem::path& source_exe,
     const std::filesystem::path& target_exe, int parent_process_id);
 

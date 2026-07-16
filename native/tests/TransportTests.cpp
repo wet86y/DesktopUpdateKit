@@ -251,6 +251,8 @@ int wmain() {
     const auto slow_release = slow_client.check_for_update();
     if (slow_release) {
         DownloadSession session(std::move(slow_client));
+        std::atomic_int notifications{};
+        session.set_changed_callback([&notifications](const SessionSnapshot&) { ++notifications; });
         expect(session.start(*slow_release), "download session starts");
         const auto began = std::chrono::steady_clock::now();
         expect(!session.start(*slow_release), "a duplicate start is rejected while downloading");
@@ -263,10 +265,12 @@ int wmain() {
         expect(session.continue_in_background(), "paused session can continue in the background");
         expect(session.snapshot().background, "background continuation is retained by the session");
         expect(session.cancel(), "active session can be cancelled");
-        const auto cancel_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (session.snapshot().state != SessionState::cancelled && std::chrono::steady_clock::now() < cancel_deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        expect(session.wait_for_stop(std::chrono::seconds(2)), "cancelled session stops within its caller deadline");
         expect(session.snapshot().state == SessionState::cancelled, "cancelled session publishes its terminal state");
+        session.set_changed_callback({});
+        const auto detached_count = notifications.load();
+        session.set_acceleration(false);
+        expect(notifications.load() == detached_count, "detached session callbacks are not invoked again");
     }
 
     std::filesystem::remove_all(temporary, ignored);

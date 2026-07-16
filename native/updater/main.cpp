@@ -1,17 +1,102 @@
 #include "DesktopUpdateKit/UpdateKit.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 using namespace desktop_update_kit;
 
+class unique_handle {
+public:
+    explicit unique_handle(HANDLE value = INVALID_HANDLE_VALUE) noexcept : value_(value) {}
+    ~unique_handle() { if (value_ != INVALID_HANDLE_VALUE && value_ != nullptr) CloseHandle(value_); }
+    unique_handle(const unique_handle&) = delete;
+    unique_handle& operator=(const unique_handle&) = delete;
+    [[nodiscard]] HANDLE get() const noexcept { return value_; }
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return value_ != INVALID_HANDLE_VALUE && value_ != nullptr;
+    }
+private:
+    HANDLE value_;
+};
+
+class bcrypt_algorithm {
+public:
+    ~bcrypt_algorithm() { if (value_) BCryptCloseAlgorithmProvider(value_, 0); }
+    BCRYPT_ALG_HANDLE* put() noexcept { return &value_; }
+    [[nodiscard]] BCRYPT_ALG_HANDLE get() const noexcept { return value_; }
+private:
+    BCRYPT_ALG_HANDLE value_{};
+};
+
+class bcrypt_hash {
+public:
+    ~bcrypt_hash() { if (value_) BCryptDestroyHash(value_); }
+    BCRYPT_HASH_HANDLE* put() noexcept { return &value_; }
+    [[nodiscard]] BCRYPT_HASH_HANDLE get() const noexcept { return value_; }
+private:
+    BCRYPT_HASH_HANDLE value_{};
+};
+
+bool copy_verified_payload(const std::filesystem::path& source, const std::filesystem::path& target,
+    const std::string& expected_sha256) {
+    // Omitting FILE_SHARE_WRITE and FILE_SHARE_DELETE binds verification and copying to one immutable file object.
+    unique_handle input(CreateFileW(source.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!input) return false;
+    unique_handle output(CreateFileW(target.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (!output) return false;
+
+    bcrypt_algorithm algorithm;
+    DWORD object_size{};
+    DWORD bytes{};
+    if (BCryptOpenAlgorithmProvider(algorithm.put(), BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
+        BCryptGetProperty(algorithm.get(), BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size),
+            sizeof(object_size), &bytes, 0) < 0) return false;
+    std::vector<UCHAR> hash_object(object_size);
+    bcrypt_hash hash;
+    if (BCryptCreateHash(algorithm.get(), hash.put(), hash_object.data(), object_size, nullptr, 0, 0) < 0)
+        return false;
+
+    std::vector<std::byte> buffer(1024 * 1024);
+    for (;;) {
+        DWORD read{};
+        if (!ReadFile(input.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) return false;
+        if (read == 0) break;
+        if (BCryptHashData(hash.get(), reinterpret_cast<PUCHAR>(buffer.data()), read, 0) < 0) return false;
+        DWORD offset{};
+        while (offset < read) {
+            DWORD written{};
+            if (!WriteFile(output.get(), buffer.data() + offset, read - offset, &written, nullptr) || written == 0)
+                return false;
+            offset += written;
+        }
+    }
+    if (!FlushFileBuffers(output.get())) return false;
+    std::array<UCHAR, 32> digest{};
+    if (BCryptFinishHash(hash.get(), digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) return false;
+    std::ostringstream actual;
+    for (const auto byte : digest)
+        actual << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+    return _stricmp(actual.str().c_str(), expected_sha256.c_str()) == 0;
+}
+
 bool keep_transaction() noexcept {
+#if defined(DUK_DIAGNOSTICS)
     return GetEnvironmentVariableW(L"DUK_KEEP_TRANSACTION", nullptr, 0) != 0;
+#else
+    return false;
+#endif
 }
 
 bool wait_for_exit(int process_id, int seconds) {
@@ -45,27 +130,32 @@ bool start_and_wait_for_health(const std::filesystem::path& target,
         }
         return false;
     }
+    if (!process.hProcess || !process.hThread) {
+        if (process.hThread) CloseHandle(process.hThread);
+        if (process.hProcess) CloseHandle(process.hProcess);
+        return false;
+    }
+    unique_handle process_handle(process.hProcess);
+    unique_handle thread_handle(process.hThread);
     const auto deadline = GetTickCount64() + static_cast<ULONGLONG>(std::clamp(seconds, 1, 300)) * 1000;
     bool healthy{};
     while (GetTickCount64() < deadline) {
         if (std::filesystem::exists(marker)) { healthy = true; break; }
-        if (WaitForSingleObject(process.hProcess, 100) == WAIT_OBJECT_0) break;
+        if (WaitForSingleObject(process_handle.get(), 100) == WAIT_OBJECT_0) break;
     }
     if (!healthy) healthy = std::filesystem::exists(marker);
     if (!healthy) {
-        TerminateProcess(process.hProcess, 1);
-        WaitForSingleObject(process.hProcess, 3000);
+        TerminateProcess(process_handle.get(), 1);
+        WaitForSingleObject(process_handle.get(), 3000);
     }
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
     return healthy;
 }
 
 void restart(const std::filesystem::path& target) {
     PROCESS_INFORMATION process{};
     if (start_process(target, L"", process)) {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+        if (process.hThread) CloseHandle(process.hThread);
+        if (process.hProcess) CloseHandle(process.hProcess);
     }
 }
 
@@ -87,15 +177,15 @@ bool move_no_replace(const std::filesystem::path& source, const std::filesystem:
 void schedule_cleanup(const std::filesystem::path& transaction_path) noexcept {
     try {
         if (keep_transaction()) return;
-        wchar_t module_buffer[32768]{};
-        const DWORD count = GetModuleFileNameW(nullptr, module_buffer, static_cast<DWORD>(std::size(module_buffer)));
+        std::vector<wchar_t> module_buffer(32768);
+        const DWORD count = GetModuleFileNameW(nullptr, module_buffer.data(), static_cast<DWORD>(module_buffer.size()));
         if (!count) return;
-        const std::filesystem::path module(module_buffer);
+        const std::filesystem::path module(module_buffer.data());
         const auto directory = transaction_path.parent_path();
-        wchar_t temporary_buffer[32768]{};
-        const DWORD temporary_count = GetTempPathW(static_cast<DWORD>(std::size(temporary_buffer)), temporary_buffer);
-        if (!temporary_count || temporary_count >= std::size(temporary_buffer)) return;
-        const auto cleaner_directory = std::filesystem::path(temporary_buffer) / L"DesktopUpdateKit-native-cleaners";
+        std::vector<wchar_t> temporary_buffer(32768);
+        const DWORD temporary_count = GetTempPathW(static_cast<DWORD>(temporary_buffer.size()), temporary_buffer.data());
+        if (!temporary_count || temporary_count >= temporary_buffer.size()) return;
+        const auto cleaner_directory = std::filesystem::path(temporary_buffer.data()) / L"DesktopUpdateKit-native-cleaners";
         std::filesystem::create_directories(cleaner_directory);
         const auto cleaner = cleaner_directory /
             (L"cleanup-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".exe");
@@ -111,8 +201,8 @@ void schedule_cleanup(const std::filesystem::path& transaction_path) noexcept {
         PROCESS_INFORMATION process{};
         if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
                 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, nullptr, cleaner_directory.c_str(), &startup, &process)) {
-            CloseHandle(process.hThread);
-            CloseHandle(process.hProcess);
+            if (process.hThread) CloseHandle(process.hThread);
+            if (process.hProcess) CloseHandle(process.hProcess);
         } else {
             remove_if_exists(cleaner);
             MoveFileExW(module.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -133,9 +223,9 @@ int cleanup_after_stub(int process_id, const std::filesystem::path& module,
         remove_if_exists(module);
         remove_if_exists(transaction);
         RemoveDirectoryW(directory.c_str());
-        wchar_t self_buffer[32768]{};
-        if (GetModuleFileNameW(nullptr, self_buffer, static_cast<DWORD>(std::size(self_buffer))))
-            MoveFileExW(self_buffer, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        std::vector<wchar_t> self_buffer(32768);
+        if (GetModuleFileNameW(nullptr, self_buffer.data(), static_cast<DWORD>(self_buffer.size())))
+            MoveFileExW(self_buffer.data(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         return 0;
     } catch (...) {
         return 40;
@@ -143,9 +233,14 @@ int cleanup_after_stub(int process_id, const std::filesystem::path& module,
 }
 
 void debug_event(const std::filesystem::path& transaction_path, const std::string& message) noexcept {
+#if defined(DUK_DIAGNOSTICS)
     if (!keep_transaction()) return;
     std::ofstream output(transaction_path.parent_path() / L"stub.log", std::ios::app);
     output << message << " error=" << GetLastError() << '\n';
+#else
+    (void)transaction_path;
+    (void)message;
+#endif
 }
 
 int update(const UpdateTransaction& transaction, const std::filesystem::path& transaction_path) {
@@ -158,8 +253,9 @@ int update(const UpdateTransaction& transaction, const std::filesystem::path& tr
         (L"." + transaction.target_exe.filename().wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".new");
     remove_if_exists(staged);
     remove_if_exists(transaction.health_marker);
-    if (!CopyFileW(transaction.downloaded_exe.c_str(), staged.c_str(), TRUE)) {
-        debug_event(transaction_path, "copy failed");
+    if (!copy_verified_payload(transaction.downloaded_exe, staged, transaction.expected_sha256)) {
+        debug_event(transaction_path, "payload verification or copy failed");
+        remove_if_exists(staged);
         cleanup_download_payload(transaction.downloaded_exe);
         schedule_cleanup(transaction_path);
         return 40;
@@ -202,7 +298,10 @@ int update(const UpdateTransaction& transaction, const std::filesystem::path& tr
 }
 
 int rename_executable(const RenameTransaction& transaction, const std::filesystem::path& transaction_path) {
-    if (!wait_for_exit(transaction.parent_process_id, transaction.parent_exit_timeout_seconds)) return 20;
+    if (!wait_for_exit(transaction.parent_process_id, transaction.parent_exit_timeout_seconds)) {
+        schedule_cleanup(transaction_path);
+        return 20;
+    }
     remove_if_exists(transaction.health_marker);
     const bool target_present = std::filesystem::exists(transaction.target_exe);
     if (target_present && !move_no_replace(transaction.target_exe, transaction.backup_exe)) {
