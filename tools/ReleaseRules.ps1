@@ -223,6 +223,11 @@ function Assert-PreparedReleaseAssets {
     }
 
     $actualHash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $binaryVersion = [string](Get-Item -LiteralPath $assetPath).VersionInfo.ProductVersion
+    $binaryVersion = $binaryVersion.TrimStart('v', 'V').Split('+', 2)[0]
+    if ($binaryVersion -ne $Version) {
+        throw "Release executable version $binaryVersion does not match requested version $Version."
+    }
     if ([string]$manifest.sha256 -ne $actualHash) {
         throw "update.json SHA-256 does not match the EXE."
     }
