@@ -157,7 +157,7 @@ int wmain(int argc, wchar_t** argv) {
         const auto success_tx = root / L"success transaction";
         std::filesystem::create_directories(success);
         std::filesystem::create_directories(success_tx);
-        const auto target = success / L"超级中键.exe";
+        const auto target = success / L"测试应用.exe";
         const auto downloaded = success / L"downloaded.exe";
         const auto backup = success / L"target.bak";
         const auto marker = success_tx / L"healthy.ok";
@@ -200,7 +200,7 @@ int wmain(int argc, wchar_t** argv) {
         const auto missing_tx = root / L"missing transaction";
         std::filesystem::create_directories(missing);
         std::filesystem::create_directories(missing_tx);
-        const auto missing_target = missing / L"超级中键.exe";
+        const auto missing_target = missing / L"测试应用.exe";
         const auto missing_downloaded = missing / L"downloaded.exe";
         const auto missing_backup = missing / L"target.bak";
         const auto missing_marker = missing_tx / L"healthy.ok";
@@ -218,7 +218,7 @@ int wmain(int argc, wchar_t** argv) {
         const auto rollback_tx = root / L"rollback transaction";
         std::filesystem::create_directories(rollback);
         std::filesystem::create_directories(rollback_tx);
-        const auto rollback_target = rollback / L"超级中键.exe";
+        const auto rollback_target = rollback / L"测试应用.exe";
         const auto rollback_downloaded = rollback / L"downloaded.exe";
         const auto rollback_backup = rollback / L"target.bak";
         const auto rollback_marker = rollback_tx / L"healthy.ok";
@@ -242,7 +242,7 @@ int wmain(int argc, wchar_t** argv) {
         const auto cleanup_tx = root / L"cleanup transaction";
         std::filesystem::create_directories(cleanup);
         std::filesystem::create_directories(cleanup_tx);
-        const auto cleanup_target = cleanup / L"超级中键.exe";
+        const auto cleanup_target = cleanup / L"测试应用.exe";
         const auto cleanup_downloaded = cleanup / L"downloaded.exe";
         const auto cleanup_backup = cleanup / L"target.bak";
         const auto cleanup_marker = cleanup_tx / L"healthy.ok";

@@ -44,5 +44,6 @@ if(BUILD_TESTING)
     target_compile_definitions(desktop_update_kit_native_transport_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_compile_options(desktop_update_kit_native_transport_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_libraries(desktop_update_kit_native_transport_tests PRIVATE desktop_update_kit_native)
-    add_test(NAME desktop_update_kit_native_transport COMMAND desktop_update_kit_native_transport_tests)
+    add_test(NAME desktop_update_kit_native_transport COMMAND desktop_update_kit_native_transport_tests
+        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/contracts")
 endif()

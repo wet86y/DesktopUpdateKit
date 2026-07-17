@@ -51,13 +51,15 @@
 
 ## 项目接入边界
 
-项目通过链接编译 `src\DesktopUpdateKit\UpdateClient.cs`、`UpdateModels.cs` 和 `UpdateLauncher.cs` 接入：
+Managed 项目通过链接编译 `src\DesktopUpdateKit\*.cs` 接入；原生项目通过 CMake 引入
+`native` 静态 SDK。两种入口遵守相同的 v1 行为契约：
 
 - 项目 UI 可以传入进度回调、暂停控制和取消令牌。
 - 项目 UI 不得创建 HTTP Range 请求、管理分段文件、合并字节块或自行计算更新包完整性。
 - 项目 UI 只能显示共享组件报告的节点 ID、进度与失败状态；不得为任何节点写专用下载逻辑。
 - 项目 UI 可在关闭时调用共享会话的暂停或后台继续操作，但不得自行持有下载线程、取消令牌或临时 EXE 路径。
 - 系统 DNS、`hosts`、代理和网络设置由用户及操作系统管理；共享组件不得改写它们，也不得硬编码 GitHub/CDN IP。
+- UI 文案、产品名、资源编号、规范 EXE 名、日志与退出回调由宿主适配层提供，不得写入共享实现。
 
 ## 验收要求
 

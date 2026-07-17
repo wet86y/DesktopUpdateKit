@@ -52,14 +52,17 @@ public sealed class UpdateClient
             return null;
         }
 
-        var remoteNodes = NormalizeNodes(release.DownloadNodes);
+        var remoteNodes = release.DownloadNodes ?? [];
         if (remoteNodes.Count > 0)
         {
             await _nodeCache.SaveNodesAsync(remoteNodes, cancellationToken);
         }
 
-        return release.Version > GetCurrentVersion() ? release : null;
+        return release.Version > (_options.CurrentVersion ?? GetCurrentVersion()) ? release : null;
     }
+
+    /// <summary>Cancels HTTP operations currently owned by this client.</summary>
+    public void CancelActiveRequests() => _httpClient.CancelPendingRequests();
 
     public async Task<string> DownloadAndVerifyAsync(
         UpdateRelease release,
@@ -184,21 +187,34 @@ public sealed class UpdateClient
     {
         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
         var root = document.RootElement;
-        var versionText = GetRequiredString(root, "version").TrimStart('v', 'V');
-        if (!Version.TryParse(versionText, out var version))
+        var version = ParseContractVersion(GetRequiredString(root, "version"));
+        if (version is null)
         {
             return null;
         }
 
-        var assetName = GetOptionalString(root, "asset") ?? _options.ExeAssetName;
-        var sha256AssetName = GetOptionalString(root, "sha256Asset") ?? $"{assetName}.sha256";
-        var tagName = GetOptionalString(root, "tag") ?? $"v{version}";
+        var repository = GetRequiredString(root, "repository");
+        var assetName = GetRequiredString(root, "asset");
+        var sha256AssetName = GetRequiredString(root, "sha256Asset");
+        var tagName = GetRequiredString(root, "tag");
+        if (!string.Equals(repository, _options.Repository, StringComparison.Ordinal)
+            || !string.Equals(assetName, _options.ExeAssetName, StringComparison.Ordinal)
+            || !string.Equals(sha256AssetName, _options.Sha256AssetName, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("The update manifest does not match the configured release contract.");
+        }
+
         var releasePageUrl = GetOptionalString(root, "releaseNotesUrl")
             ?? $"https://github.com/{_options.Repository}/releases/tag/{Uri.EscapeDataString(tagName)}";
         var releaseNotes = GetOptionalString(root, "releaseNotes") ?? string.Empty;
         var exeSize = GetOptionalInt64(root, "size");
-        var expectedSha256 = GetRequiredString(root, "sha256");
-        var nodes = ParseNodes(root);
+        if (exeSize is not > 0)
+        {
+            throw new InvalidDataException("The update manifest is missing a valid executable size.");
+        }
+
+        var expectedSha256 = ParseSha256(GetRequiredString(root, "sha256"));
+        var nodes = ParseManifestNodes(root);
 
         // Download nodes must always receive a fixed tag URL rather than a
         // latest-release URL, otherwise a release change during download could
@@ -223,33 +239,44 @@ public sealed class UpdateClient
 
     private static Version GetCurrentVersion() => ApplicationVersionProvider.GetCurrentVersion();
 
-    private static IReadOnlyList<UpdateDownloadNode>? ParseNodes(JsonElement root)
+    private static IReadOnlyList<UpdateDownloadNode> ParseManifestNodes(JsonElement root)
     {
         if (!root.TryGetProperty("downloadNodes", out var nodesElement)
-            || nodesElement.ValueKind != JsonValueKind.Array)
+            || nodesElement.ValueKind != JsonValueKind.Array
+            || nodesElement.GetArrayLength() == 0)
         {
-            return null;
+            throw new InvalidDataException("The update manifest must include download nodes.");
         }
 
         var nodes = new List<UpdateDownloadNode>();
+        var knownIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var element in nodesElement.EnumerateArray())
         {
             if (element.ValueKind != JsonValueKind.Object)
             {
-                continue;
+                throw new InvalidDataException("An update download node is not an object.");
             }
 
-            var id = GetOptionalString(element, "id");
-            var template = GetOptionalString(element, "template");
+            var id = GetRequiredString(element, "id");
+            var template = GetRequiredString(element, "template");
             var priority = GetOptionalInt32(element, "priority");
-            var enabled = GetOptionalBoolean(element, "enabled") ?? true;
-            if (id is not null && template is not null && priority is not null)
+            var enabled = GetOptionalBoolean(element, "enabled");
+            if (priority is null || priority is < -10_000 or > 10_000 || enabled is null
+                || !TryNormalizeNode(new UpdateDownloadNode(id, template, priority.Value, enabled.Value), out var normalized)
+                || !knownIds.Add(normalized.Id))
             {
-                nodes.Add(new UpdateDownloadNode(id, template, priority.Value, enabled));
+                throw new InvalidDataException("An update download node is insecure, duplicated, or invalid.");
             }
+
+            nodes.Add(normalized);
         }
 
-        return nodes;
+        if (!nodes.Any(node => string.Equals(node.Id, "github-direct", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new InvalidDataException("The update manifest must include the official direct node.");
+        }
+
+        return nodes.OrderBy(node => node.Priority).ToArray();
     }
 
     private static IReadOnlyList<UpdateDownloadNode> NormalizeNodes(IReadOnlyList<UpdateDownloadNode>? nodes)
@@ -746,6 +773,30 @@ public sealed class UpdateClient
         }
 
         return hashToken.ToUpperInvariant();
+    }
+
+    private static Version? ParseContractVersion(string input)
+    {
+        var text = input.Trim();
+        if (text.StartsWith('v') || text.StartsWith('V'))
+        {
+            text = text[1..];
+        }
+
+        var suffix = 0;
+        while (suffix < text.Length && (char.IsDigit(text[suffix]) || text[suffix] == '.'))
+        {
+            suffix++;
+        }
+        text = text[..suffix];
+
+        var parts = text.Split('.');
+        return parts.Length == 3
+            && int.TryParse(parts[0], out var major) && major >= 0
+            && int.TryParse(parts[1], out var minor) && minor >= 0
+            && int.TryParse(parts[2], out var patch) && patch >= 0
+                ? new Version(major, minor, patch)
+                : null;
     }
 
     private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)

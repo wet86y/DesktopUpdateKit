@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -94,6 +95,12 @@ internal static class Program
         try
         {
             File.Copy(transaction.DownloadedExePath, stagedPath, overwrite: false);
+            if (!string.IsNullOrWhiteSpace(transaction.ExpectedSha256)
+                && !HasExpectedSha256(stagedPath, transaction.ExpectedSha256))
+            {
+                throw new InvalidDataException("The staged update does not match the expected SHA-256.");
+            }
+
             File.Move(transaction.TargetExePath, transaction.BackupExePath, overwrite: false);
             File.Move(stagedPath, transaction.TargetExePath, overwrite: false);
 
@@ -159,6 +166,19 @@ internal static class Program
         }
         catch (ArgumentException) { return true; }
         catch (InvalidOperationException) { return true; }
+    }
+
+    private static bool HasExpectedSha256(string path, string expectedSha256)
+    {
+        if (expectedSha256.Length != 64 || expectedSha256.Any(character => !Uri.IsHexDigit(character)))
+        {
+            return false;
+        }
+
+        using var stream = File.OpenRead(path);
+        var actual = SHA256.HashData(stream);
+        var expected = Convert.FromHexString(expectedSha256);
+        return CryptographicOperations.FixedTimeEquals(actual, expected);
     }
 
     private static void RestoreBackup(UpdateTransaction transaction)
@@ -333,7 +353,8 @@ internal sealed record UpdateTransaction(
     string BackupExePath,
     string HealthMarkerPath,
     int ParentExitTimeoutSeconds,
-    int HealthTimeoutSeconds);
+    int HealthTimeoutSeconds,
+    string? ExpectedSha256);
 
 internal sealed record ExecutableRenameTransaction(
     int ParentProcessId,

@@ -1,6 +1,8 @@
 /build/
 /bin/
 /obj/
+**/bin/
+**/obj/
 /artifacts/
 /.vs/
 *.user

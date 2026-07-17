@@ -24,12 +24,14 @@ public sealed record UpdateDownloadSessionSnapshot(
 /// without cancelling an active download; callers explicitly choose whether a
 /// closed UI pauses the transfer or lets it continue in the background.
 /// </summary>
-public sealed class UpdateDownloadSession : IDisposable
+public sealed class UpdateDownloadSession : IDisposable, IAsyncDisposable
 {
     private readonly object _sync = new();
+    private readonly object _callbackSync = new();
     private readonly UpdateClient _client;
     private UpdateDownloadControl? _control;
     private CancellationTokenSource? _cancellation;
+    private Task? _runTask;
     private UpdateDownloadSessionSnapshot _snapshot = new(UpdateDownloadSessionState.Idle, null, null, null, null, false, true);
     private bool _disposed;
 
@@ -64,8 +66,7 @@ public sealed class UpdateDownloadSession : IDisposable
 
             _cancellation?.Dispose();
             _cancellation = new CancellationTokenSource();
-            _control = new UpdateDownloadControl();
-            _control.SetUseAccelerationNodes(useAccelerationNodes);
+            _control = new UpdateDownloadControl(useAccelerationNodes);
             _snapshot = new UpdateDownloadSessionSnapshot(
                 UpdateDownloadSessionState.Downloading,
                 release,
@@ -74,7 +75,7 @@ public sealed class UpdateDownloadSession : IDisposable
                 ErrorMessage: null,
                 ContinueInBackground: false,
                 UseAccelerationNodes: useAccelerationNodes);
-            _ = RunAsync(release, _control, _cancellation);
+            _runTask = RunAsync(release, _control, _cancellation);
         }
 
         RaiseChanged();
@@ -184,6 +185,7 @@ public sealed class UpdateDownloadSession : IDisposable
 
             _control.Resume();
             _cancellation.Cancel();
+            _client.CancelActiveRequests();
         }
 
         return true;
@@ -203,22 +205,99 @@ public sealed class UpdateDownloadSession : IDisposable
         }
     }
 
-    public void Dispose()
+    /// <summary>Cancels active work and waits up to the supplied timeout for the worker to stop.</summary>
+    public async Task<bool> StopAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
     {
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        Task? worker;
         lock (_sync)
         {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
+            worker = _runTask;
             _control?.Resume();
             _cancellation?.Cancel();
-            _cancellation?.Dispose();
-            _cancellation = null;
-            _control = null;
+            _client.CancelActiveRequests();
         }
+
+        if (worker is null || worker.IsCompleted)
+        {
+            return true;
+        }
+
+        try
+        {
+            await worker.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Deletes a verified download after the host decides not to install it.</summary>
+    public bool DiscardCompleted()
+    {
+        string? downloadedPath;
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            if (_snapshot.State != UpdateDownloadSessionState.Completed
+                || string.IsNullOrWhiteSpace(_snapshot.DownloadedPath))
+            {
+                return false;
+            }
+
+            downloadedPath = _snapshot.DownloadedPath;
+            _snapshot = new UpdateDownloadSessionSnapshot(
+                UpdateDownloadSessionState.Idle, null, null, null, null, false, _snapshot.UseAccelerationNodes);
+        }
+
+        try
+        {
+            var directory = Path.GetDirectoryName(downloadedPath);
+            if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+        catch
+        {
+            // A stale verified download is safe and can be cleaned by a later run.
+        }
+
+        RaiseChanged();
+        return true;
+    }
+
+    public void Dispose()
+    {
+        lock (_callbackSync)
+        {
+            lock (_sync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                _control?.Resume();
+                _cancellation?.Cancel();
+                _client.CancelActiveRequests();
+                Changed = null;
+            }
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await StopAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        Dispose();
+        GC.SuppressFinalize(this);
     }
 
     private async Task RunAsync(
@@ -283,12 +362,32 @@ public sealed class UpdateDownloadSession : IDisposable
             _control = null;
             _cancellation?.Dispose();
             _cancellation = null;
+            _runTask = null;
         }
 
         RaiseChanged();
     }
 
-    private void RaiseChanged() => Changed?.Invoke(this, Snapshot);
+    private void RaiseChanged()
+    {
+        lock (_callbackSync)
+        {
+            EventHandler<UpdateDownloadSessionSnapshot>? handler;
+            UpdateDownloadSessionSnapshot snapshot;
+            lock (_sync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                handler = Changed;
+                snapshot = _snapshot;
+            }
+
+            handler?.Invoke(this, snapshot);
+        }
+    }
 
     private void ThrowIfDisposed()
     {

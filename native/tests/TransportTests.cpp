@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -24,7 +25,7 @@ void expect(bool condition, const char* message) {
 
 class FixtureTransport final : public HttpTransport {
 public:
-    FixtureTransport() {
+    explicit FixtureTransport(std::string manifest = {}) : manifest_(std::move(manifest)) {
         payload_.resize(2 * 1024 * 1024);
         for (std::size_t index = 0; index < payload_.size(); ++index)
             payload_[index] = static_cast<std::byte>((index * 31) % 251);
@@ -44,11 +45,15 @@ public:
 
     HttpResponse get(const HttpRequest& request, const ChunkSink& sink, std::stop_token token) override {
         if (request.url.ends_with("/update.json")) {
+            if (!manifest_.empty()) {
+                emit(request, sink, std::as_bytes(std::span(manifest_)), token);
+                return {200, "application/json", manifest_.size(), {}};
+            }
             const std::string repository = bad_manifest_ ? "attacker/repo" : "fixture/repo";
             const std::string declared_hash = final_hash_mismatch_ ? std::string(64, '0') : kHash;
             const std::string manifest = "{\"version\":\"2.0.1\",\"repository\":\"" + repository +
-                "\",\"tag\":\"v2.0.1\",\"asset\":\"super-middle-key.exe\","
-                "\"sha256Asset\":\"super-middle-key.exe.sha256\",\"sha256\":\"" + declared_hash +
+                "\",\"tag\":\"v2.0.1\",\"asset\":\"fixture-app.exe\","
+                "\"sha256Asset\":\"fixture-app.exe.sha256\",\"sha256\":\"" + declared_hash +
                 "\",\"size\":2097152,\"releaseNotes\":\"fixture\",\"downloadNodes\":[" +
                 (insecure_node_ ? "{\"id\":\"insecure\",\"template\":\"http://example.invalid/{url}\",\"priority\":1,\"enabled\":true}," : "") +
                 "{\"id\":\"github-direct\",\"template\":\"{url}\",\"priority\":1000,\"enabled\":true}]}";
@@ -58,11 +63,11 @@ public:
         if (request.url.ends_with(".sha256")) {
             const std::string published = bad_sha_asset_ ? std::string(64, 'f')
                 : final_hash_mismatch_ ? std::string(64, '0') : std::string(kHash);
-            const std::string hash = published + "  super-middle-key.exe\n";
+            const std::string hash = published + "  fixture-app.exe\n";
             emit(request, sink, std::as_bytes(std::span(hash)), token);
             return {200, "text/plain", hash.size(), {}};
         }
-        if (!request.url.ends_with("super-middle-key.exe")) return {404, "text/plain", 0, {}};
+        if (!request.url.ends_with("fixture-app.exe")) return {404, "text/plain", 0, {}};
         if (html_payload_) {
             const std::string html = "<!doctype html><html><body>proxy error</body></html>";
             emit(request, sink, std::as_bytes(std::span(html)), token);
@@ -111,6 +116,7 @@ private:
     }
 
     std::vector<std::byte> payload_;
+    std::string manifest_;
     bool parallel_failure_{};
     bool bad_manifest_{};
     bool slow_{};
@@ -126,11 +132,21 @@ private:
 };
 
 ClientOptions options(const std::filesystem::path& temporary) {
-    ClientOptions value{L"desktop-update-kit-fixture", "fixture/repo", "super-middle-key.exe",
-        "super-middle-key.exe.sha256", {2, 0, 0}, temporary};
+    ClientOptions value{L"desktop-update-kit-fixture", "fixture/repo", "fixture-app.exe",
+        "fixture-app.exe.sha256", {2, 0, 0}, temporary};
     value.download.parallel_threshold = 1024 * 1024;
     value.download.max_connections = 4;
     return value;
+}
+
+ClientOptions contract_options(const std::filesystem::path& temporary) {
+    return {L"desktop-update-kit-contract-fixture", "fixture/repo", "fixture.exe",
+        "fixture.exe.sha256", {1, 0, 0}, temporary};
+}
+
+std::string read_text(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input), {}};
 }
 
 void expect_download_failure(const std::filesystem::path& temporary,
@@ -148,7 +164,7 @@ void expect_download_failure(const std::filesystem::path& temporary,
 }
 }
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     const auto temporary = std::filesystem::temp_directory_path() / L"desktop-update-kit-transport-tests";
     std::error_code ignored;
     std::filesystem::remove_all(temporary, ignored);
@@ -274,5 +290,26 @@ int wmain() {
     }
 
     std::filesystem::remove_all(temporary, ignored);
+
+    if (argc == 2) {
+        const std::filesystem::path fixtures(argv[1]);
+        auto valid_transport = std::make_shared<FixtureTransport>(read_text(fixtures / L"valid-update.json"));
+        UpdateClient contract_client(contract_options(temporary), valid_transport);
+        expect(contract_client.check_for_update().has_value(),
+            "the shared valid manifest fixture is accepted by native");
+
+        auto invalid_transport = std::make_shared<FixtureTransport>(
+            read_text(fixtures / L"invalid-repository-update.json"));
+        try {
+            UpdateClient invalid_client(contract_options(temporary), invalid_transport);
+            (void)invalid_client.check_for_update();
+            expect(false, "the shared repository mismatch fixture is rejected by native");
+        } catch (const std::exception&) {
+            expect(true, "the shared repository mismatch fixture is rejected by native");
+        }
+    } else {
+        expect(false, "the shared contract fixture directory is provided");
+    }
+
     return failures ? 1 : 0;
 }

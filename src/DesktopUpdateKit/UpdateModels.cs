@@ -6,7 +6,8 @@ public sealed record UpdateClientOptions(
     string ExeAssetName,
     string Sha256AssetName,
     string? TempDirectoryName = null,
-    UpdateDownloadOptions? DownloadOptions = null);
+    UpdateDownloadOptions? DownloadOptions = null,
+    Version? CurrentVersion = null);
 
 /// <summary>
 /// Reusable transport policy for full update packages. The client probes HTTP
@@ -88,7 +89,12 @@ public sealed class UpdateDownloadControl
     private readonly object _sync = new();
     private TaskCompletionSource? _resumeSignal;
     private CancellationTokenSource _nodeSwitchCancellation = new();
-    private bool _useAccelerationNodes = true;
+    private bool _useAccelerationNodes;
+
+    public UpdateDownloadControl(bool useAccelerationNodes = true)
+    {
+        _useAccelerationNodes = useAccelerationNodes;
+    }
 
     public bool IsPaused
     {
@@ -214,4 +220,5 @@ public sealed record UpdateTransaction(
     string BackupExePath,
     string HealthMarkerPath,
     int ParentExitTimeoutSeconds = 30,
-    int HealthTimeoutSeconds = 30);
+    int HealthTimeoutSeconds = 30,
+    string? ExpectedSha256 = null);

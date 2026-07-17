@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.IO;
-using System.Reflection;
 using System.Security;
 using System.Text.Json;
 
@@ -8,9 +7,36 @@ namespace DesktopUpdateKit;
 
 public sealed class UpdateLauncher
 {
-    private const string StubResourceName = "DesktopUpdateKit.Resources.UpdaterStub.exe";
+    private readonly IUpdaterStubSource _stubSource;
 
+    public UpdateLauncher(IUpdaterStubSource? stubSource = null)
+    {
+        _stubSource = stubSource ?? new EmbeddedResourceUpdaterStubSource();
+    }
+
+    [Obsolete("Pass the verified release SHA-256 so the updater stub can revalidate the staged executable.")]
     public async Task LaunchAsync(string downloadedExePath, CancellationToken cancellationToken = default)
+    {
+        await LaunchCoreAsync(downloadedExePath, expectedSha256: null, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task LaunchAsync(
+        string downloadedExePath,
+        string expectedSha256,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsSha256(expectedSha256))
+        {
+            throw new ArgumentException("The expected SHA-256 must contain exactly 64 hexadecimal characters.", nameof(expectedSha256));
+        }
+
+        await LaunchCoreAsync(downloadedExePath, expectedSha256.ToLowerInvariant(), cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task LaunchCoreAsync(
+        string downloadedExePath,
+        string? expectedSha256,
+        CancellationToken cancellationToken)
     {
         if (!File.Exists(downloadedExePath))
         {
@@ -52,7 +78,8 @@ public sealed class UpdateLauncher
             Path.GetFullPath(targetExePath),
             Path.GetFullPath(downloadedExePath),
             backupPath,
-            healthMarkerPath);
+            healthMarkerPath,
+            ExpectedSha256: expectedSha256);
         await File.WriteAllTextAsync(
             transactionPath,
             JsonSerializer.Serialize(transaction, new JsonSerializerOptions { WriteIndented = true }),
@@ -145,17 +172,16 @@ public sealed class UpdateLauncher
         return true;
     }
 
-    private static async Task ExtractStubAsync(string destinationPath, CancellationToken cancellationToken)
+    private async Task ExtractStubAsync(string destinationPath, CancellationToken cancellationToken)
     {
-        var assembly = Assembly.GetEntryAssembly()
-            ?? throw new InvalidOperationException("The application assembly is unavailable.");
-        await using var resource = assembly.GetManifestResourceStream(StubResourceName)
-            ?? throw new InvalidOperationException(
-                "UpdaterStub is not embedded in this build. Use the shared release publishing script first.");
+        await using var resource = await _stubSource.OpenReadAsync(cancellationToken).ConfigureAwait(false);
 
         await using var output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         await resource.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
     }
+
+    private static bool IsSha256(string? value) =>
+        value is { Length: 64 } && value.All(Uri.IsHexDigit);
 
     private static void EnsureDirectoryWritable(string directory)
     {
